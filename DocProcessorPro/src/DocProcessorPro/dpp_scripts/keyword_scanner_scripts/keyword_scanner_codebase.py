@@ -1,13 +1,14 @@
 """
 Pure keyword/regex PDF page scanner.
 
-scan_pdf(pdf_path, categories, min_hits) -> list[PageMatch]
+scan_pdf(pdf_path, categories, min_hits) -> ScanResult
 scan_directory(input_dir, output_dir, categories, min_hits) -> dict[str, list[PageMatch]]
 """
 
 from __future__ import annotations
 
 import csv
+import datetime
 import io
 import logging
 import os
@@ -15,6 +16,7 @@ import re
 import shutil
 import sys
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,6 +31,59 @@ from PIL import Image, ImageDraw, ImageFont
 log = logging.getLogger(__name__)
 
 _MIN_NATIVE_CHARS = 100
+
+# Date extraction helpers
+
+_DATE_RE = re.compile(
+    r"\b(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})\b"
+    r"|(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})\b"
+    r"|\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?"
+    r"|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?"
+    r"|Dec(?:ember)?)\s+(\d{1,2}),?\s+(\d{4})\b"
+    r"|\b(\d{1,2})\s+(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May"
+    r"|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?"
+    r"|Nov(?:ember)?|Dec(?:ember)?)\s+(\d{4})\b",
+    re.IGNORECASE,
+)
+_MONTH_MAP = {
+    "jan": 1,
+    "feb": 2,
+    "mar": 3,
+    "apr": 4,
+    "may": 5,
+    "jun": 6,
+    "jul": 7,
+    "aug": 8,
+    "sep": 9,
+    "oct": 10,
+    "nov": 11,
+    "dec": 12,
+}
+
+
+def _extract_dates(text: str) -> list[datetime.date]:
+    """Return sorted unique dates found in text, filtered to 1900-2099."""
+    found: set[datetime.date] = set()
+    for m in _DATE_RE.finditer(text):
+        g = m.groups()
+        try:
+            if g[0] is not None:  # MM/DD/YYYY or M-D-YY
+                mo, day, yr = int(g[0]), int(g[1]), int(g[2])
+                if yr < 100:
+                    yr += 2000 if yr < 50 else 1900
+            elif g[3] is not None:  # YYYY-MM-DD
+                yr, mo, day = int(g[3]), int(g[4]), int(g[5])
+            elif g[6] is not None:  # Month DD, YYYY
+                mo = _MONTH_MAP[g[6][:3].lower()]
+                day, yr = int(g[7]), int(g[8])
+            else:  # DD Month YYYY
+                day, yr = int(g[9]), int(g[11])
+                mo = _MONTH_MAP[g[10][:3].lower()]
+            if 1900 <= yr <= 2099:
+                found.add(datetime.date(yr, mo, day))
+        except (ValueError, KeyError):
+            pass
+    return sorted(found)
 
 
 # External binary detection (Tesseract + Poppler)
@@ -205,6 +260,22 @@ class PageMatch:
     keywords_hit: list[str]
     extraction_method: str  # "pdfplumber" or "ocr"
     total_hits: int
+    dates_on_page: list[str] = field(
+        default_factory=list
+    )  # ISO dates found on this page
+
+
+@dataclass
+class ScanResult:
+    """Return value of scan_pdf(), bundling page matches with per-document date info."""
+
+    matches: list[PageMatch]
+    source_date_first: str | None  # ISO YYYY-MM-DD, earliest date across all pages
+    source_date_last: str | None  # ISO YYYY-MM-DD, latest date across all pages
+    source_date_count: int  # number of unique dates found across all pages
+    all_page_dates: dict[
+        int, list[str]
+    ]  # 0-indexed page → ISO date strings (all pages)
 
 
 # DEFAULT KEYWORD CATEGORIES
@@ -536,6 +607,69 @@ CATEGORY_BEHAVIORAL_HEALTH = KeywordCategory(
     ],
 )
 
+CATEGORY_DOCUMENT_SECTIONS = KeywordCategory(
+    name="Document Sections",
+    keywords=[
+        # ER / hospital records
+        "discharge summary",
+        "discharge note",
+        "history and physical",
+        "history & physical",
+        "H&P",
+        "consultation note",
+        "consult note",
+        "consultation report",
+        "progress note",
+        "physician note",
+        "attending note",
+        "attending physician note",
+        "admission note",
+        "admission history",
+        "admitting note",
+        "emergency physician",
+        "emergency department note",
+        "ED physician",
+        "triage note",
+        "intake note",
+        "final diagnosis",
+        "principal diagnosis",
+        "admitting diagnosis",
+        "condition on discharge",
+        "discharge condition",
+        "follow-up instructions",
+        "aftercare instructions",
+        "operative note",
+        "procedure note",
+        "surgical note",
+        # PT / therapy records
+        "initial evaluation",
+        "evaluation note",
+        "treatment plan",
+        "plan of care",
+        "re-evaluation",
+        "functional outcome",
+        "discharge from therapy",
+        # Imaging
+        "radiology report",
+        "imaging report",
+        # Behavioral health
+        "psychiatric evaluation",
+        "mental status examination",
+        "psychotherapy note",
+        "initial psychiatric",
+        "psychological evaluation",
+        "treatment plan note",
+        # Legal / IME
+        "medical legal report",
+        "independent medical evaluation",
+        "qualified medical evaluation",
+        "panel QME report",
+    ],
+    patterns=[
+        r"\b(?:discharge|admission|progress|consultation|attending|physician|operative|procedure|triage|intake|initial)\s+(?:summary|note|report|history|evaluation)\b",
+    ],
+)
+
 DEFAULT_CATEGORIES: list[KeywordCategory] = [
     CATEGORY_THERAPY,
     CATEGORY_MEDICAL_TREATMENT,
@@ -543,6 +677,7 @@ DEFAULT_CATEGORIES: list[KeywordCategory] = [
     CATEGORY_INJURY_LEGAL,
     CATEGORY_IMAGING,
     CATEGORY_BEHAVIORAL_HEALTH,
+    CATEGORY_DOCUMENT_SECTIONS,
 ]
 
 
@@ -553,16 +688,18 @@ def scan_pdf(
     pdf_path: str,
     categories: list[KeywordCategory],
     min_hits: int = 1,
+    require_categories: frozenset[str] | None = None,
     progress_callback: Callable[[str], None] | None = None,
-) -> list[PageMatch]:
+) -> ScanResult:
     """
-    Scan every page of a PDF for keyword matches.
+    Scan every page of a PDF for keyword matches and extract all dates.
 
     Opens pdfplumber once for the whole document, then does a second pass
     for any pages whose text content falls below _MIN_NATIVE_CHARS (OCR
-    fallback via Tesseract). Keyword matching runs after both passes.
+    fallback via Tesseract). Keyword matching and date extraction run after
+    both passes across all pages.
 
-    Returns: PageMatch list sorted by page_num for pages where total_hits >= min_hits.
+    Returns: ScanResult with matched pages and per-document date summary.
     """
     path = Path(pdf_path)
     if not path.exists():
@@ -583,32 +720,55 @@ def scan_pdf(
                 page_texts.append((native, "pdfplumber"))  # placeholder
                 ocr_needed.append(i)
 
-    # Pass 2: OCR for pages with insufficient native text
+    # Pass 2: OCR for pages with insufficient native text.
+    # Render all OCR-needed pages in a single pdftoppm call (first→last range)
+    # to avoid the per-page process-launch overhead, then run Tesseract per page.
     if ocr_needed:
         log.debug(
             "%s: %d page(s) below threshold — running OCR.", path.name, len(ocr_needed)
         )
+        first_ocr = min(ocr_needed)
+        last_ocr = max(ocr_needed)
+        if progress_callback:
+            progress_callback(
+                f"{path.name}: rendering {len(ocr_needed)} page(s) for OCR…"
+            )
+        try:
+            all_images = convert_from_path(
+                pdf_path,
+                poppler_path=_POPPLER_BIN,  # type: ignore[arg-type]
+                first_page=first_ocr + 1,
+                last_page=last_ocr + 1,
+                dpi=300,
+            )
+        except Exception:
+            log.warning("%s: batch page render failed — OCR skipped.", path.name)
+            all_images = []
+
         for idx, page_num in enumerate(ocr_needed, 1):
             if progress_callback:
                 progress_callback(
                     f"{path.name}: OCR page {page_num + 1} ({idx}/{len(ocr_needed)})…"
                 )
+            if not all_images:
+                continue
             try:
-                images = convert_from_path(
-                    pdf_path,
-                    poppler_path=_POPPLER_BIN,  # type: ignore[arg-type]
-                    first_page=page_num + 1,
-                    last_page=page_num + 1,
-                    dpi=300,
-                )
-                text = str(pytesseract.image_to_string(images[0]))
+                image = all_images[page_num - first_ocr]
+                text = str(pytesseract.image_to_string(image))
                 page_texts[page_num] = (text, "ocr")
             except Exception:
                 log.warning("Page %d: OCR failed, keeping native text.", page_num)
 
-    # Pass 3: keyword matching
+    # Pass 3: keyword matching + date extraction (all pages)
     matches: list[PageMatch] = []
+    all_page_dates: dict[int, list[str]] = {}
+    all_dates: set[datetime.date] = set()
+
     for i, (text, method) in enumerate(page_texts):
+        page_dates = _extract_dates(text)
+        all_dates.update(page_dates)
+        all_page_dates[i] = [d.isoformat() for d in page_dates]
+
         all_keywords: list[str] = []
         matched_categories: list[str] = []
         for cat in categories:
@@ -617,7 +777,11 @@ def scan_pdf(
                 matched_categories.append(cat.name)
                 all_keywords.extend(hits)
         total = len(all_keywords)
-        if total >= min_hits:
+        passes_min_hits = total >= min_hits
+        passes_required = require_categories is None or bool(
+            set(matched_categories) & require_categories
+        )
+        if passes_min_hits and passes_required:
             matches.append(
                 PageMatch(
                     page_num=i,
@@ -625,18 +789,27 @@ def scan_pdf(
                     keywords_hit=all_keywords,
                     extraction_method=method,
                     total_hits=total,
+                    dates_on_page=all_page_dates[i],
                 )
             )
             log.debug("Page %d matched: %s", i + 1, matched_categories)
 
+    unique_dates = sorted(all_dates)
     log.info(
-        "%s: %d / %d pages matched (min_hits=%d).",
+        "%s: %d / %d pages matched (min_hits=%d). %d unique date(s) found.",
         path.name,
         len(matches),
         page_count,
         min_hits,
+        len(unique_dates),
     )
-    return matches
+    return ScanResult(
+        matches=matches,
+        source_date_first=unique_dates[0].isoformat() if unique_dates else None,
+        source_date_last=unique_dates[-1].isoformat() if unique_dates else None,
+        source_date_count=len(unique_dates),
+        all_page_dates=all_page_dates,
+    )
 
 
 # OUTPUT WRITERS
@@ -707,12 +880,18 @@ def write_manifest(
     pdf_stem: str,
     matches: list[PageMatch],
     output_csv_path: str,
+    source_date_first: str | None = None,
+    source_date_last: str | None = None,
+    source_date_count: int = 0,
 ) -> None:
     """
     Write a CSV manifest with one row per matched page.
 
-    Columns: page_num (1-indexed), categories_matched, keywords_hit, extraction_method, total_hits.
+    Columns: page_num (1-indexed), categories_matched, keywords_hit,
+    extraction_method, total_hits, dates_on_page, source_date_first,
+    source_date_last, source_date_count.
 
+    source_date_* columns repeat the same value on every row (per-PDF summary).
     Multi-value fields are pipe-separated.
     """
     out = Path(output_csv_path)
@@ -727,6 +906,10 @@ def write_manifest(
                 "keywords_hit",
                 "extraction_method",
                 "total_hits",
+                "dates_on_page",
+                "source_date_first",
+                "source_date_last",
+                "source_date_count",
             ]
         )
         for m in sorted(matches, key=lambda x: x.page_num):
@@ -737,10 +920,47 @@ def write_manifest(
                     "|".join(m.keywords_hit),
                     m.extraction_method,
                     m.total_hits,
+                    "|".join(m.dates_on_page),
+                    source_date_first or "",
+                    source_date_last or "",
+                    source_date_count,
                 ]
             )
 
     log.info("Manifest written to %s.", out.name)
+
+
+def write_dates_csv(
+    all_page_dates: dict[int, list[str]],
+    output_csv_path: str,
+) -> None:
+    """
+    Write a per-PDF dates inventory CSV.
+
+    Columns: date (ISO), pages_found (pipe-separated 1-indexed page numbers).
+    Covers all pages in the source document, sorted by date ascending.
+    """
+    date_to_pages: dict[str, list[int]] = {}
+    for page_num, dates in all_page_dates.items():
+        for d in dates:
+            date_to_pages.setdefault(d, []).append(page_num + 1)
+
+    if not date_to_pages:
+        return
+
+    out = Path(output_csv_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["date", "pages_found"])
+        for date_iso in sorted(date_to_pages):
+            writer.writerow(
+                [
+                    date_iso,
+                    "|".join(str(p) for p in sorted(date_to_pages[date_iso])),
+                ]
+            )
+    log.info("Dates CSV written to %s.", out.name)
 
 
 # CONSOLIDATION HELPERS
@@ -894,6 +1114,51 @@ def consolidate_manifests(
     return dest
 
 
+def consolidate_dates(
+    output_dir: str,
+    pdf_stems: list[str],
+) -> Path | None:
+    """
+    Merge every {stem}_dates.csv into _consolidated_dates.csv,
+    prepending a source_pdf column so each row is traceable to its origin file.
+
+    Returns: Path to the consolidated CSV, or None if nothing was written.
+    """
+    out = Path(output_dir)
+    all_rows: list[dict] = []
+
+    for stem in pdf_stems:
+        csv_path = out / f"{stem}_dates.csv"
+        if not csv_path.exists():
+            continue
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                all_rows.append({"source_pdf": f"{stem}.pdf", **row})
+
+    if not all_rows:
+        return None
+
+    dest = out / "_consolidated_dates.csv"
+    fieldnames = list(all_rows[0].keys())
+    with open(dest, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+    log.info(
+        "Consolidated dates CSV written to %s (%d row(s)).", dest.name, len(all_rows)
+    )
+
+    for stem in pdf_stems:
+        individual = out / f"{stem}_dates.csv"
+        if individual.exists():
+            individual.unlink()
+            log.debug("Removed individual dates CSV: %s", individual.name)
+
+    return dest
+
+
 # BATCH PROCESSOR
 
 
@@ -903,6 +1168,7 @@ def scan_directory(
     categories: list[KeywordCategory],
     min_hits: int = 1,
     page_buffer: int = 0,
+    require_categories: frozenset[str] | None = None,
     progress_callback: Callable[[str], None] | None = None,
 ) -> dict[str, list[PageMatch]]:
     """
@@ -930,36 +1196,35 @@ def scan_directory(
         return {}
 
     log.info("Processing %d PDF(s) from %s (recursive).", len(pdfs), in_dir)
-    results: dict[str, list[PageMatch]] = {}
-    safe_stems: list[str] = []
 
-    for idx, pdf_path in enumerate(pdfs, 1):
-        # Build a collision-safe stem from the relative path so that
-        # subfolder/billing/report.pdf and subfolder/records/report.pdf
-        # produce distinct output file names.
+    # Pre-compute collision-safe stems in sorted order so that consolidation
+    # order is deterministic regardless of which threads finish first.
+    items: list[tuple[Path, str]] = []
+    for pdf_path in pdfs:
         rel_parts = pdf_path.relative_to(in_dir).with_suffix("").parts
-        safe_stem = "_".join(rel_parts)
-        safe_stems.append(safe_stem)
+        items.append((pdf_path, "_".join(rel_parts)))
 
+    results: dict[str, list[PageMatch]] = {}
+
+    def _scan_one(pdf_path: Path, safe_stem: str) -> tuple[str, list[PageMatch]]:
         if progress_callback:
-            progress_callback(f"Scanning {pdf_path.name} ({idx}/{len(pdfs)})…")
+            progress_callback(f"Scanning {pdf_path.name}…")
         try:
-            matches = scan_pdf(
+            result = scan_pdf(
                 str(pdf_path),
                 categories,
                 min_hits=min_hits,
+                require_categories=require_categories,
                 progress_callback=progress_callback,
             )
         except Exception:
             log.exception("Failed to scan %s — skipping.", pdf_path.name)
-            results[safe_stem] = []
-            continue
+            return safe_stem, []
 
-        results[safe_stem] = matches
-
+        matches = result.matches
         if not matches:
             log.info("%s: no matches.", pdf_path.name)
-            continue
+            return safe_stem, []
 
         extract_matched_pages(
             str(pdf_path),
@@ -971,12 +1236,40 @@ def scan_directory(
             safe_stem,
             matches,
             str(out_dir / f"{safe_stem}_manifest.csv"),
+            source_date_first=result.source_date_first,
+            source_date_last=result.source_date_last,
+            source_date_count=result.source_date_count,
         )
+        write_dates_csv(
+            result.all_page_dates,
+            str(out_dir / f"{safe_stem}_dates.csv"),
+        )
+        return safe_stem, matches
+
+    max_workers = min(len(pdfs), os.cpu_count() or 4)
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_scan_one, p, s): (p, s) for p, s in items}
+        for fut in as_completed(futures):
+            pdf_path, safe_stem = futures[fut]
+            completed += 1
+            try:
+                stem, matches = fut.result()
+                results[stem] = matches
+            except Exception:
+                log.exception("Unexpected error processing %s.", pdf_path.name)
+                results[safe_stem] = []
+            if progress_callback:
+                progress_callback(
+                    f"Finished {pdf_path.name} ({completed}/{len(pdfs)})…"
+                )
 
     # Consolidate across all source PDFs that had matches, preserving scan order
+    safe_stems = [s for _, s in items]
     matched_stems = [s for s in safe_stems if results.get(s)]
     if matched_stems:
         consolidate_to_pdf(output_dir, matched_stems, progress_callback)
         consolidate_manifests(output_dir, matched_stems)
+        consolidate_dates(output_dir, matched_stems)
 
     return results

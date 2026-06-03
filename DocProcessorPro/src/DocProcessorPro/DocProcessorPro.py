@@ -14,6 +14,7 @@ from pathlib import Path
 from PySide6.QtCore import QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QFileDialog,
     QFormLayout,
@@ -38,13 +39,19 @@ class _ScanWorker(QThread):
     error = Signal(str)
 
     def __init__(
-        self, input_dir: str, output_dir: str, min_hits: int, page_buffer: int
+        self,
+        input_dir: str,
+        output_dir: str,
+        min_hits: int,
+        page_buffer: int,
+        require_categories: frozenset[str] | None,
     ) -> None:
         super().__init__()
         self._input_dir = input_dir
         self._output_dir = output_dir
         self._min_hits = min_hits
         self._page_buffer = page_buffer
+        self._require_categories = require_categories
 
     def run(self) -> None:
         try:
@@ -59,6 +66,7 @@ class _ScanWorker(QThread):
                 DEFAULT_CATEGORIES,
                 min_hits=self._min_hits,
                 page_buffer=self._page_buffer,
+                require_categories=self._require_categories,
                 progress_callback=self.progress.emit,
             )
             total_matches = sum(len(v) for v in results.values())
@@ -182,6 +190,16 @@ class ScannerDialog(QDialog):
         )
         form.addRow("Page buffer:", self._page_buffer_spin)
 
+        # Document section filter checkbox
+        self._doc_section_check = QCheckBox("Require document section match")
+        self._doc_section_check.setToolTip(
+            "Only include pages that are identified as a clinical note, summary, or "
+            "report header (e.g. discharge summary, consultation note, H&P, radiology "
+            "report). Filters out nursing flowsheets, medication lists, and billing "
+            "pages. Uncheck to restore the default broad-match behaviour."
+        )
+        form.addRow("", self._doc_section_check)
+
         root.addLayout(form)
 
         # Run button
@@ -225,11 +243,17 @@ class ScannerDialog(QDialog):
         self._run_btn.setEnabled(False)
         self._status_label.setText("Scanning… this may take a while for large batches.")
 
+        require = (
+            frozenset({"Document Sections"})
+            if self._doc_section_check.isChecked()
+            else None
+        )
         self._worker = _ScanWorker(
             input_dir,
             output_dir,
             self._min_hits_spin.value(),
             self._page_buffer_spin.value(),
+            require,
         )
         self._worker.progress.connect(self._status_label.setText)
         self._worker.finished.connect(self._on_finished)
