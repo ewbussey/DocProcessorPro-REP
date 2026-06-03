@@ -1,0 +1,49 @@
+version: 1
+disable_existing_loggers: False
+
+filters:
+  GlobalContextFilter:
+    (): DocProcessorPro.logging_resources.log_context.GlobalContextFilter
+
+formatters:
+  DefaultJSONFormatter:
+    (): DocProcessorPro.logging_resources.log_context.DefaultJSONFormatter
+    style: "{"
+    format: "{name} {module} {funcName} {lineno} {asctime} {levelname} {message} {stack_info}"
+    rename_fields:
+      levelname: log_level
+      asctime: timestamp
+      lineno: line_number
+      module: module_name
+      funcName: function_name
+
+  DefaultConsoleFormatter:
+    (): DocProcessorPro.logging_resources.log_context.DefaultConsoleFormatter
+    style: "{"
+    format: "{name} {module} {funcName} {lineno} {asctime} {levelname} {message} {stack_info}"
+
+handlers:
+  default_json_handler:
+    class: logging.StreamHandler
+    formatter: DefaultJSONFormatter
+    filters: [GlobalContextFilter]
+    level: INFO
+
+  file_handler:
+    class: DocProcessorPro.logging_resources.log_context.JSONFileHandler
+    filters: [GlobalContextFilter]
+    level: INFO
+    maxBytes: 500000
+    backupCount: 5
+    mode: "a"
+    delay: True
+
+loggers:
+  DocProcessorPro:
+    handlers: [default_json_handler, file_handler]
+    level: INFO
+    propagate: False
+
+root:
+  handlers: [default_json_handler, file_handler]
+  level: INFO

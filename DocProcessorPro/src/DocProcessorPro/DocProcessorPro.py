@@ -290,11 +290,31 @@ class ScannerDialog(QDialog):
 # GUI ENTRY POINT
 
 
+def _suppress_subprocess_windows() -> None:
+    """Prevent native-exe subprocess calls (pdftoppm, tesseract) from flashing
+    console windows in the frozen build."""
+    if sys.platform != "win32" or not getattr(sys, "_MEIPASS", None):
+        return
+    import subprocess
+
+    _CREATE_NO_WINDOW = 0x08000000
+    _orig = subprocess.Popen.__init__
+
+    def _patched(self, *args, creationflags: int = 0, **kwargs) -> None:
+        _orig(self, *args, creationflags=creationflags | _CREATE_NO_WINDOW, **kwargs)
+
+    subprocess.Popen.__init__ = _patched  # type: ignore[method-assign]
+
+
 def main() -> None:
+    _suppress_subprocess_windows()
+
+    from DocProcessorPro.logging_resources.log_context import setup_logging
     from DocProcessorPro.dpp_scripts.update_scripts.update_codebase import (
         save_install_location,
     )
 
+    setup_logging()
     save_install_location()
 
     app = QApplication.instance() or QApplication(sys.argv)
