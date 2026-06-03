@@ -1,0 +1,50 @@
+# DocProcessorPro — active pipeline dependencies
+# Generated from pip freeze; trimmed to keyword scanner + GUI + update checker only.
+# Run:  pip install -r requirements.txt
+
+# --- GUI ---
+PySide6==6.11.1
+PySide6_Addons==6.11.1
+PySide6_Essentials==6.11.1
+shiboken6==6.11.1
+
+# --- PDF text extraction ---
+pdfplumber==0.11.9
+pdfminer.six==20251230
+pypdfium2==5.7.0
+
+# --- PDF reading / writing ---
+pypdf==6.10.2
+
+# --- OCR ---
+pytesseract==0.3.13
+pdf2image==1.17.0
+pillow==12.2.0
+
+# --- Keyword matching ---
+regex==2026.4.4
+
+# --- Update checker ---
+requests==2.33.1
+packaging==26.2
+
+# Transitive — requests
+certifi==2026.4.22
+charset-normalizer==3.4.7
+idna==3.13
+urllib3==2.6.3
+
+# --- Shared runtime transitive ---
+typing_extensions==4.15.0
+
+# --- Build toolchain (not bundled into the app) ---
+pyinstaller==6.20.0
+pyinstaller-hooks-contrib==2026.5
+altgraph==0.17.5
+pefile==2024.8.26
+pywin32-ctypes==0.2.3
+setuptools==81.0.0
+
+# --- Type stubs (dev only) ---
+types-regex==2026.5.9.20260518
+types-requests==2.33.0.20260518

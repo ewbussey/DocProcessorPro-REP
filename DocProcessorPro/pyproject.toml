@@ -1,0 +1,74 @@
+# Pyrefly header
+[tool.pyrefly]
+
+# Confirguring type checks and import sources
+project-includes = [
+    "**/*.py*"
+]
+search-path = [
+    "src"
+]
+
+# Configuring Python environment
+python-version = ">=3.14"
+
+# Build system header
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "DocProcessorPro"
+version = "0.3.0-alpha"
+description = "A collection of document processing automation scripts."
+authors = [
+    {name = "Eric Bussey", email = "ewbussey@gmail.com"}
+]
+maintainers = [
+    {name = "Eric Bussey", email = "ewbussey@gmail.com"}
+]
+
+dependencies = [
+    # GUI
+    "PySide6==6.11.1",
+    "PySide6_Addons==6.11.1",
+    "PySide6_Essentials==6.11.1",
+    "shiboken6==6.11.1",
+    # PDF text extraction
+    "pdfplumber==0.11.9",
+    "pdfminer.six==20251230",
+    "pypdfium2==5.7.0",
+    # PDF reading / writing
+    "pypdf==6.10.2",
+    # OCR
+    "pytesseract==0.3.13",
+    "pdf2image==1.17.0",
+    "pillow==12.2.0",
+    # Keyword matching
+    "regex==2026.4.4",
+    # Update checker
+    "requests==2.33.1",
+    "packaging==26.2",
+    # Transitive — requests
+    "certifi==2026.4.22",
+    "charset-normalizer==3.4.7",
+    "idna==3.13",
+    "urllib3==2.6.3",
+    # Shared runtime transitive
+    "typing_extensions==4.15.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller==6.20.0",
+    "pyinstaller-hooks-contrib==2026.5",
+    "altgraph==0.17.5",
+    "pefile==2024.8.26",
+    "pywin32-ctypes==0.2.3",
+    "setuptools==81.0.0",
+    "types-regex==2026.5.9.20260518",
+    "types-requests==2.33.0.20250516",
+]
