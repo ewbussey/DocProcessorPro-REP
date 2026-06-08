@@ -233,7 +233,7 @@ class KeywordCategory:
             if self._CPT_RE.fullmatch(kw):
                 pat = r"(?<!\d)" + regex.escape(kw) + r"(?!\d)"
             else:
-                pat = r"\b" + regex.escape(kw) + r"\b"
+                pat = r"\b" + regex.escape(kw) + r"s?\b"
             compiled.append(regex.compile(pat, regex.IGNORECASE))
             terms.append(kw)
         for raw in self.patterns:
@@ -343,11 +343,12 @@ CATEGORY_THERAPY = KeywordCategory(
 CATEGORY_MEDICAL_TREATMENT = KeywordCategory(
     name="MEDICAL_TREATMENT",
     keywords=[
+        "assessment",
+        "plan",
         "diagnosis",
         "diagnoses",
         "prognosis",
         "treatment",
-        "assessment",
         "evaluation",
         "examination",
         "prescription",
@@ -363,6 +364,7 @@ CATEGORY_MEDICAL_TREATMENT = KeywordCategory(
         "ROS",
         "physical examination",
         "impression",
+        "clinical summary",
         "discharge summary",
         "discharge instructions",
         "inpatient",
@@ -379,6 +381,14 @@ CATEGORY_MEDICAL_TREATMENT = KeywordCategory(
         "heart rate",
         "temperature",
         "presenting complaint",
+        "recommend",
+        "patient complaint",
+        "office visit",
+        "consultation",
+        "consult",
+        "discharge prescription",
+        "post-operative order",
+        "postoperative order",
     ],
     patterns=[
         r"\b[A-Z]\d{2}(?:\.\d{1,4})?\b",
@@ -422,13 +432,24 @@ CATEGORY_BILLING = KeywordCategory(
         "copay",
         "coinsurance",
         "deductible",
-        "units",
+        "unit",
         "modifier",
         "place of service",
         "POS",
         "NPI",
         "TIN",
         "tax ID",
+        "total price",
+        "billed",
+        "unit price",
+        "balance",
+        "receipt",
+        "payment",
+        "fee",
+        "CPT",
+        "ICD",
+        "HCPCS",
+        "visit code",
     ],
     patterns=[
         r"(?<!\d)[A-Z]\d{4}(?!\d)",
@@ -449,6 +470,12 @@ CATEGORY_INJURY_LEGAL = KeywordCategory(
         "MVA",
         "motor vehicle collision",
         "MVC",
+        "affidavit",
+        "petition",
+        "objection to",
+        "objections to",
+        "request for",
+        "requests for",
         "workers compensation",
         "workers comp",
         "work comp",
@@ -491,6 +518,11 @@ CATEGORY_INJURY_LEGAL = KeywordCategory(
         "settlement",
         "demand letter",
         "independent medical evaluation",
+        "FCE",
+        "narrative report",
+        "work status",
+        "restricted to",
+        "restrict from",
     ],
     patterns=[
         r"\b\d{1,3}%\s+(?:whole\s+person\s+)?impairment\b",
@@ -524,13 +556,22 @@ CATEGORY_IMAGING = KeywordCategory(
         "electromyography",
         "nerve conduction study",
         "NCS",
-        "findings",
+        "finding",
         "impression",
         "without contrast",
         "with contrast",
         "T1",
         "T2",
         "FLAIR",
+        "flexion",
+        "extension",
+        "anterior",
+        "posterior",
+        "superior",
+        "inferior",
+        "lateral",
+        "medial",
+        "oblique",
         "axial",
         "sagittal",
         "coronal",
@@ -600,6 +641,8 @@ CATEGORY_BEHAVIORAL_HEALTH = KeywordCategory(
         "MSE",
         "suicidal ideation",
         "homicidal ideation",
+        "session",
+        "progress note",
     ],
     patterns=[
         r"\b[FZ]\d{2}(?:\.\d{1,4})?\b",
@@ -610,12 +653,17 @@ CATEGORY_BEHAVIORAL_HEALTH = KeywordCategory(
 CATEGORY_DOCUMENT_SECTIONS = KeywordCategory(
     name="Document Sections",
     keywords=[
-        # ER / hospital records
+        # ER / hospital / medical records
         "discharge summary",
         "discharge note",
         "history and physical",
         "history & physical",
         "H&P",
+        "chief complaint",
+        "patient complaint",
+        "office visit",
+        "consultation",
+        "consult",
         "consultation note",
         "consult note",
         "consultation report",
@@ -632,38 +680,88 @@ CATEGORY_DOCUMENT_SECTIONS = KeywordCategory(
         "triage note",
         "intake note",
         "final diagnosis",
+        "final diagnoses",
+        "discharge diagnosis",
+        "discharge diagnoses",
         "principal diagnosis",
         "admitting diagnosis",
         "condition on discharge",
-        "discharge condition",
+        "discharge prescription",
         "follow-up instructions",
         "aftercare instructions",
         "operative note",
         "procedure note",
         "surgical note",
+        "post-operative order",
+        "postoperative order",
+        "conclusions",
+        "MD",
+        "DO",
+        "DPT",
+        "PhD",
+        "PsyD",
+        "LPC",
+        "LMFT",
+        "LCSW",
+        "FAANS",
+        "plan",
+        "assessment",
         # PT / therapy records
         "initial evaluation",
-        "evaluation note",
+        "evaluation",
         "treatment plan",
         "plan of care",
+        "care plan",
         "re-evaluation",
         "functional outcome",
-        "discharge from therapy",
+        "discharge",
         # Imaging
         "radiology report",
         "imaging report",
+        "interpretation",
+        "impression",
         # Behavioral health
         "psychiatric evaluation",
         "mental status examination",
         "psychotherapy note",
         "initial psychiatric",
         "psychological evaluation",
-        "treatment plan note",
+        "treatment note",
         # Legal / IME
+        "affidavit",
+        "petition",
+        "petition for",
+        "objection to",
+        "objections to",
+        "request for",
+        "requests for",
         "medical legal report",
         "independent medical evaluation",
-        "qualified medical evaluation",
-        "panel QME report",
+        "IME",
+        "functional capacity evaluation",
+        "FCE",
+        "impairment rating",
+        "narrative report",
+        "work status",
+        "work restrictions",
+        "modified duty",
+        "light duty",
+        "restricted to",
+        "restrict from",
+        # Billing
+        "invoice",
+        "total price",
+        "billed amount",
+        "billed",
+        "unit price",
+        "balance",
+        "receipt",
+        "payment",
+        "fee",
+        "CPT",
+        "ICD",
+        "HCPCS",
+        "visit code",
     ],
     patterns=[
         r"\b(?:discharge|admission|progress|consultation|attending|physician|operative|procedure|triage|intake|initial)\s+(?:summary|note|report|history|evaluation)\b",
@@ -721,41 +819,28 @@ def scan_pdf(
                 ocr_needed.append(i)
 
     # Pass 2: OCR for pages with insufficient native text.
-    # Render all OCR-needed pages in a single pdftoppm call (first→last range)
-    # to avoid the per-page process-launch overhead, then run Tesseract per page.
+    # Render and OCR one page at a time to keep peak memory at ~25 MB per page
+    # rather than loading all pages simultaneously (~25 MB × N pages).
     if ocr_needed:
         log.debug(
             "%s: %d page(s) below threshold — running OCR.", path.name, len(ocr_needed)
         )
-        first_ocr = min(ocr_needed)
-        last_ocr = max(ocr_needed)
-        if progress_callback:
-            progress_callback(
-                f"{path.name}: rendering {len(ocr_needed)} page(s) for OCR…"
-            )
-        try:
-            all_images = convert_from_path(
-                pdf_path,
-                poppler_path=_POPPLER_BIN,  # type: ignore[arg-type]
-                first_page=first_ocr + 1,
-                last_page=last_ocr + 1,
-                dpi=300,
-            )
-        except Exception:
-            log.warning("%s: batch page render failed — OCR skipped.", path.name)
-            all_images = []
-
         for idx, page_num in enumerate(ocr_needed, 1):
             if progress_callback:
                 progress_callback(
                     f"{path.name}: OCR page {page_num + 1} ({idx}/{len(ocr_needed)})…"
                 )
-            if not all_images:
-                continue
             try:
-                image = all_images[page_num - first_ocr]
-                text = str(pytesseract.image_to_string(image))
-                page_texts[page_num] = (text, "ocr")
+                images = convert_from_path(
+                    pdf_path,
+                    poppler_path=_POPPLER_BIN,  # type: ignore[arg-type]
+                    first_page=page_num + 1,
+                    last_page=page_num + 1,
+                    dpi=300,
+                )
+                if images:
+                    text = str(pytesseract.image_to_string(images[0]))
+                    page_texts[page_num] = (text, "ocr")
             except Exception:
                 log.warning("Page %d: OCR failed, keeping native text.", page_num)
 
