@@ -453,7 +453,6 @@ CATEGORY_BILLING = KeywordCategory(
     ],
     patterns=[
         r"(?<!\d)[A-Z]\d{4}(?!\d)",
-        r"(?<!\d)\d{5}(?!\d)",
         r"\b[A-Z]\d{2}(?:\.\d{1,4})?\b",
         r"\b\d{1,2}/\d{1,2}/\d{2,4}\b",
         r"\b\d{4}-\d{2}-\d{2}\b",
@@ -474,8 +473,6 @@ CATEGORY_INJURY_LEGAL = KeywordCategory(
         "petition",
         "objection to",
         "objections to",
-        "request for",
-        "requests for",
         "workers compensation",
         "workers comp",
         "work comp",
@@ -556,12 +553,9 @@ CATEGORY_IMAGING = KeywordCategory(
         "electromyography",
         "nerve conduction study",
         "NCS",
-        "finding",
         "impression",
         "without contrast",
         "with contrast",
-        "T1",
-        "T2",
         "FLAIR",
         "flexion",
         "extension",
@@ -592,6 +586,7 @@ CATEGORY_IMAGING = KeywordCategory(
         r"\b[CTLS]\d{1,2}[-–]\d{1,2}\b",
         r"\b[CTLS]\d{1,2}\b",
         r"\b(?:accession|study|exam)\s*(?:no|number|#)[:\s]*[\w\-]+\b",
+        r"\bT[12][-\s]weighted\b",
     ],
 )
 
@@ -650,6 +645,81 @@ CATEGORY_BEHAVIORAL_HEALTH = KeywordCategory(
     ],
 )
 
+CATEGORY_VOCATIONAL = KeywordCategory(
+    name="VOCATIONAL",
+    keywords=[
+        # Work history
+        "work history",
+        "employment history",
+        "job history",
+        "employment record",
+        "prior employment",
+        "previous employment",
+        "occupational history",
+        "vocational history",
+        "employer",
+        "employment",
+        # Earnings / wages
+        "wages",
+        "salary",
+        "earnings",
+        "income",
+        "compensation",
+        "lost wages",
+        "wage loss",
+        "earning capacity",
+        "loss of earning capacity",
+        "lost income",
+        "annual income",
+        "hourly wage",
+        "hourly rate",
+        "weekly wage",
+        "monthly income",
+        "IRS",
+        "W2",
+        "1099",
+        "social security",
+        "SSA",
+        "bank statement",
+        "paystub",
+        # Job descriptions / duties
+        "job description",
+        "job duties",
+        "job demands",
+        "essential functions",
+        "physical demands",
+        "occupational duties",
+        "job title",
+        "occupation",
+        # Physical work restrictions / capacity
+        "work capacity",
+        "work tolerance",
+        "sedentary",
+        "sedentary work",
+        "light work",
+        "medium work",
+        "heavy work",
+        "lifting limit",
+        "lifting restriction",
+        "return to work",
+        "RTW",
+        "unable to work",
+        "work ability",
+        "full duty",
+        "transitional work",
+        "job placement",
+        "vocational rehabilitation",
+        "vocational assessment",
+        "vocational evaluation",
+        "transferable skills",
+        "labor market",
+    ],
+    patterns=[
+        r"\blift(?:ing)?\s+(?:up\s+to\s+)?\d+\s*(?:lbs?|pounds?)\b",
+        r"\b(?:stand|sit|walk)\s+(?:up\s+to\s+)?\d+\s*(?:hours?|hrs?)\b",
+    ],
+)
+
 CATEGORY_DOCUMENT_SECTIONS = KeywordCategory(
     name="Document Sections",
     keywords=[
@@ -695,15 +765,6 @@ CATEGORY_DOCUMENT_SECTIONS = KeywordCategory(
         "post-operative order",
         "postoperative order",
         "conclusions",
-        "MD",
-        "DO",
-        "DPT",
-        "PhD",
-        "PsyD",
-        "LPC",
-        "LMFT",
-        "LCSW",
-        "FAANS",
         "plan",
         "assessment",
         # PT / therapy records
@@ -748,6 +809,28 @@ CATEGORY_DOCUMENT_SECTIONS = KeywordCategory(
         "light duty",
         "restricted to",
         "restrict from",
+        # Vocational
+        "vocational assessment",
+        "vocational evaluation",
+        "vocational rehabilitation",
+        "earning capacity",
+        "wage loss",
+        "lost wages",
+        "work history",
+        "employment history",
+        "job duties",
+        "physical demands",
+        "return to work",
+        "RTW",
+        "job",
+        "paystub",
+        "IRS",
+        "W2",
+        "tax return",
+        "bank statement",
+        "SSA",
+        "1099",
+        "social security",
         # Billing
         "invoice",
         "total price",
@@ -775,7 +858,20 @@ DEFAULT_CATEGORIES: list[KeywordCategory] = [
     CATEGORY_INJURY_LEGAL,
     CATEGORY_IMAGING,
     CATEGORY_BEHAVIORAL_HEALTH,
+    CATEGORY_VOCATIONAL,
     CATEGORY_DOCUMENT_SECTIONS,
+]
+
+
+# Pages matching any of these patterns are excluded regardless of keyword hits.
+# They identify known-irrelevant page types (nursing flowsheets, MAR sheets, etc.)
+# that would otherwise trigger broad category keywords.
+_IRRELEVANT_PAGE_PATTERNS: list[re.Pattern] = [
+    re.compile(r"MEDICATION\s+ADMINISTRATION\s+RECORD", re.IGNORECASE),
+    re.compile(r"NURSING\s+FLOW\s*SHEET", re.IGNORECASE),
+    re.compile(r"INTAKE\s+(?:AND\s+)?OUTPUT", re.IGNORECASE),
+    re.compile(r"VITAL\s+SIGNS\s+FLOW\s*SHEET", re.IGNORECASE),
+    re.compile(r"MEDICATION\s+RECONCILIATION", re.IGNORECASE),
 ]
 
 
@@ -853,6 +949,10 @@ def scan_pdf(
         page_dates = _extract_dates(text)
         all_dates.update(page_dates)
         all_page_dates[i] = [d.isoformat() for d in page_dates]
+
+        if any(pat.search(text) for pat in _IRRELEVANT_PAGE_PATTERNS):
+            log.debug("Page %d skipped — matched irrelevant-page blocklist.", i + 1)
+            continue
 
         all_keywords: list[str] = []
         matched_categories: list[str] = []
@@ -1117,6 +1217,7 @@ def consolidate_to_pdf(
     out = Path(output_dir)
     writer = pypdf.PdfWriter()
     included = 0
+    current_page = 0
 
     for stem in pdf_stems:
         matched = out / f"{stem}_matched.pdf"
@@ -1125,15 +1226,18 @@ def consolidate_to_pdf(
         if progress_callback:
             progress_callback(f"Consolidating: {stem}…")
 
-        # Separator page
+        # Separator page — bookmark points here
         sep_buf = _make_separator_page(f"{stem}.pdf")
         sep_reader = pypdf.PdfReader(sep_buf)
         writer.add_page(sep_reader.pages[0])
+        writer.add_outline_item(f"{stem}.pdf", current_page)
+        current_page += 1
 
         # Matched pages
         reader = pypdf.PdfReader(str(matched))
         for page in reader.pages:
             writer.add_page(page)
+            current_page += 1
 
         included += 1
 
