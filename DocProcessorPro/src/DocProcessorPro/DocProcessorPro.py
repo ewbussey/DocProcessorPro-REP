@@ -182,9 +182,9 @@ class ScannerDialog(QDialog):
 
         # Page buffer QSpinBox
         self._page_buffer_spin = QSpinBox()
-        self._page_buffer_spin.setMinimum(0)
+        self._page_buffer_spin.setMinimum(2)
         self._page_buffer_spin.setMaximum(10)
-        self._page_buffer_spin.setValue(0)
+        self._page_buffer_spin.setValue(2)
         self._page_buffer_spin.setToolTip(
             "Number of pages before and after each keyword hit to include in the output."
         )

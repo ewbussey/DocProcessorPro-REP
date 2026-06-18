@@ -130,6 +130,7 @@ def _find_tesseract() -> str | None:
     for candidate in (
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        r"C:\Supporting_Libraries\Tesseract-OCR\tesseract.exe",
     ):
         if Path(candidate).is_file():
             log.debug("Tesseract found at common path: %s", candidate)
@@ -167,6 +168,7 @@ def _find_poppler() -> str | None:
         Path(r"C:\Program Files\poppler"),
         Path(r"C:\Program Files (x86)\poppler"),
         Path(r"C:\poppler"),
+        Path(r"C:\Supporting_Libraries"),
     )
     for root in search_roots:
         if not root.exists():
@@ -283,8 +285,15 @@ class ScanResult:
 _THERAPY_PLAIN = [
     "therapeutic",
     "physical therapy",
+    "active therapy",
     "occupational therapy",
+    "speech therapy",
+    "aquatic therapy",
     "vestibular",
+    "vestibular rehabilitation therapy",
+    "neurocognitive therapy",
+    "neurocognitive rehabilitation",
+    "cognitive rehabilitation therapy",
     "chiropractic",
     "manipulation",
     "reeducation",
@@ -309,8 +318,9 @@ CATEGORY_THERAPY = KeywordCategory(
     + [
         "PT",
         "OT",
-        "speech therapy",
-        "aquatic therapy",
+        "VRT",
+        "CRT",
+        "ST",
         "dry needling",
         "massage therapy",
         "myofascial",
@@ -343,6 +353,7 @@ CATEGORY_THERAPY = KeywordCategory(
 CATEGORY_MEDICAL_TREATMENT = KeywordCategory(
     name="MEDICAL_TREATMENT",
     keywords=[
+        "history",
         "assessment",
         "plan",
         "diagnosis",
@@ -365,6 +376,7 @@ CATEGORY_MEDICAL_TREATMENT = KeywordCategory(
         "physical examination",
         "impression",
         "clinical summary",
+        "discharge",
         "discharge summary",
         "discharge instructions",
         "inpatient",
@@ -615,6 +627,9 @@ CATEGORY_BEHAVIORAL_HEALTH = KeywordCategory(
         "adjustment disorder",
         "GAD",
         "generalized anxiety",
+        "anxious",
+        "depress",
+        "depressed",
         "major depressive disorder",
         "MDD",
         "cognitive behavioral therapy",
@@ -638,6 +653,8 @@ CATEGORY_BEHAVIORAL_HEALTH = KeywordCategory(
         "homicidal ideation",
         "session",
         "progress note",
+        "cognitive",
+        "neurocognitive",
     ],
     patterns=[
         r"\b[FZ]\d{2}(?:\.\d{1,4})?\b",
@@ -660,12 +677,12 @@ CATEGORY_VOCATIONAL = KeywordCategory(
         "employer",
         "employment",
         # Earnings / wages
-        "wages",
+        "wage",
         "salary",
-        "earnings",
+        "earning",
         "income",
         "compensation",
-        "lost wages",
+        "lost wage",
         "wage loss",
         "earning capacity",
         "loss of earning capacity",
@@ -682,12 +699,15 @@ CATEGORY_VOCATIONAL = KeywordCategory(
         "SSA",
         "bank statement",
         "paystub",
+        "deposit",
         # Job descriptions / duties
         "job description",
+        "job duty",
         "job duties",
-        "job demands",
-        "essential functions",
-        "physical demands",
+        "job demand",
+        "essential function",
+        "physical demand",
+        "occupational duty",
         "occupational duties",
         "job title",
         "occupation",
@@ -711,7 +731,7 @@ CATEGORY_VOCATIONAL = KeywordCategory(
         "vocational rehabilitation",
         "vocational assessment",
         "vocational evaluation",
-        "transferable skills",
+        "transferable skill",
         "labor market",
     ],
     patterns=[
@@ -815,7 +835,7 @@ CATEGORY_DOCUMENT_SECTIONS = KeywordCategory(
         "vocational rehabilitation",
         "earning capacity",
         "wage loss",
-        "lost wages",
+        "wage",
         "work history",
         "employment history",
         "job duties",
@@ -937,8 +957,10 @@ def scan_pdf(
                 if images:
                     text = str(pytesseract.image_to_string(images[0]))
                     page_texts[page_num] = (text, "ocr")
-            except Exception:
-                log.warning("Page %d: OCR failed, keeping native text.", page_num)
+            except Exception as exc:
+                log.warning(
+                    "Page %d: OCR failed (%s), keeping native text.", page_num, exc
+                )
 
     # Pass 3: keyword matching + date extraction (all pages)
     matches: list[PageMatch] = []
@@ -1203,6 +1225,61 @@ def _make_separator_page(source_filename: str) -> io.BytesIO:
     return buf
 
 
+def _ocr_consolidated(
+    dest: Path,
+    progress_callback: Callable[[str], None] | None = None,
+) -> None:
+    """
+    Add a searchable text layer to dest in-place using ocrmypdf.
+
+    Pages that already carry native text are skipped (skip_text=True) so
+    pdfplumber-extracted pages are left untouched; only image-only pages
+    (scanned originals and separator pages) get an OCR overlay.
+
+    Writes to a sibling .ocr.pdf temp file then atomically replaces dest so
+    a failure never corrupts the original consolidated PDF.
+    """
+    try:
+        import ocrmypdf
+    except ImportError:
+        log.warning(
+            "ocrmypdf is not installed — skipping OCR of consolidated PDF. "
+            "Add ocrmypdf to your dependencies to enable this step."
+        )
+        return
+
+    if progress_callback:
+        progress_callback("Running OCR on consolidated PDF…")
+
+    # ocrmypdf discovers Tesseract via PATH; patch it in if we have a resolved path.
+    old_path: str | None = None
+    if _TESSERACT_EXE:
+        tess_dir = str(Path(_TESSERACT_EXE).parent)
+        current = os.environ.get("PATH", "")
+        if tess_dir not in current.split(os.pathsep):
+            old_path = current
+            os.environ["PATH"] = tess_dir + os.pathsep + current
+
+    tmp = dest.with_suffix(".ocr.pdf")
+    try:
+        ocrmypdf.ocr(
+            dest,
+            tmp,
+            skip_text=True,
+            language="eng",
+            progress_bar=False,
+        )
+        tmp.replace(dest)
+        log.info("OCR text layer added to %s.", dest.name)
+    except Exception:
+        log.warning("OCR of consolidated PDF failed — original kept.", exc_info=True)
+        if tmp.exists():
+            tmp.unlink()
+    finally:
+        if old_path is not None:
+            os.environ["PATH"] = old_path
+
+
 def consolidate_to_pdf(
     output_dir: str,
     pdf_stems: list[str],
@@ -1457,8 +1534,10 @@ def scan_directory(
     safe_stems = [s for _, s in items]
     matched_stems = [s for s in safe_stems if results.get(s)]
     if matched_stems:
-        consolidate_to_pdf(output_dir, matched_stems, progress_callback)
+        consolidated = consolidate_to_pdf(output_dir, matched_stems, progress_callback)
         consolidate_manifests(output_dir, matched_stems)
         consolidate_dates(output_dir, matched_stems)
+        if consolidated:
+            _ocr_consolidated(consolidated, progress_callback)
 
     return results
