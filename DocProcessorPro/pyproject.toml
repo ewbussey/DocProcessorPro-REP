@@ -33,46 +33,46 @@ maintainers = [
 
 dependencies = [
     # GUI
-    "PySide6==6.11.1",
-    "PySide6_Addons==6.11.1",
-    "PySide6_Essentials==6.11.1",
-    "shiboken6==6.11.1",
+    "PySide6>=6.11.1",
+    "PySide6_Addons>=6.11.1",
+    "PySide6_Essentials>=6.11.1",
+    "shiboken6>=6.11.1",
     # PDF text extraction
-    "pdfplumber==0.11.9",
-    "pdfminer.six==20251230",
-    "pypdfium2==5.7.0",
+    "pdfplumber>=0.11.9",
+    "pdfminer.six>=20251230",
+    "pypdfium2>=5.7.0",
     # PDF reading / writing
-    "pypdf==6.10.2",
+    "pypdf>=6.10.2",
     # OCR
-    "pytesseract==0.3.13",
-    "pdf2image==1.17.0",
-    "pillow==12.2.0",
-    "ocrmypdf==17.7.0",
+    "pytesseract>=0.3.13",
+    "pdf2image>=1.17.0",
+    "pillow>=12.2.0",
+    "ocrmypdf>=17.7.0",
     # Logging
-    "PyYAML==6.0.3",
-    "python-json-logger==4.1.0",
+    "PyYAML>=6.0.3",
+    "python-json-logger>=4.1.0",
     # Keyword matching
-    "regex==2026.4.4",
+    "regex>=2026.4.4",
     # Update checker
-    "requests==2.33.1",
-    "packaging==26.2",
+    "requests>=2.33.1",
+    "packaging>=26.2",
     # Transitive — requests
-    "certifi==2026.4.22",
-    "charset-normalizer==3.4.7",
-    "idna==3.13",
-    "urllib3==2.6.3",
+    "certifi>=2026.4.22",
+    "charset-normalizer>=3.4.7",
+    "idna>=3.13",
+    "urllib3>=2.6.3",
     # Shared runtime transitive
-    "typing_extensions==4.15.0",
+    "typing_extensions>=4.15.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pyinstaller==6.20.0",
-    "pyinstaller-hooks-contrib==2026.5",
-    "altgraph==0.17.5",
-    "pefile==2024.8.26",
-    "pywin32-ctypes==0.2.3",
-    "setuptools==81.0.0",
-    "types-regex==2026.5.9.20260518",
-    "types-requests==2.33.0.20250516",
+    "pyinstaller>=6.20.0",
+    "pyinstaller-hooks-contrib>=2026.5",
+    "altgraph>=0.17.5",
+    "pefile>=2024.8.26",
+    #"pywin32-ctypes>=0.2.3",
+    "setuptools>=81.0.0",
+    "types-regex>=2026.5.9.20260518",
+    "types-requests>=2.33.0.20250516",
 ]

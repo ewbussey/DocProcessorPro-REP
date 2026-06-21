@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDialog,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -42,9 +43,10 @@ class _ScanWorker(QThread):
         self,
         input_dir: str,
         output_dir: str,
-        min_hits: int,
+        min_hits: float,
         page_buffer: int,
         require_categories: frozenset[str] | None,
+        require_anchor: bool = False,
     ) -> None:
         super().__init__()
         self._input_dir = input_dir
@@ -52,6 +54,7 @@ class _ScanWorker(QThread):
         self._min_hits = min_hits
         self._page_buffer = page_buffer
         self._require_categories = require_categories
+        self._require_anchor = require_anchor
 
     def run(self) -> None:
         try:
@@ -67,6 +70,7 @@ class _ScanWorker(QThread):
                 min_hits=self._min_hits,
                 page_buffer=self._page_buffer,
                 require_categories=self._require_categories,
+                require_anchor=self._require_anchor,
                 progress_callback=self.progress.emit,
             )
             total_matches = sum(len(v) for v in results.values())
@@ -170,19 +174,24 @@ class ScannerDialog(QDialog):
         output_row.addWidget(output_browse)
         form.addRow("Output folder:", output_row)
 
-        # Min-hits QSpinBox
-        self._min_hits_spin = QSpinBox()
-        self._min_hits_spin.setMinimum(1)
-        self._min_hits_spin.setMaximum(50)
-        self._min_hits_spin.setValue(1)
+        # Min-score QDoubleSpinBox
+        self._min_hits_spin = QDoubleSpinBox()
+        self._min_hits_spin.setMinimum(0.5)
+        self._min_hits_spin.setMaximum(100.0)
+        self._min_hits_spin.setSingleStep(0.5)
+        self._min_hits_spin.setValue(3.0)
         self._min_hits_spin.setToolTip(
-            "Minimum number of distinct keyword/pattern matches for a page to be included."
+            "Minimum weighted score for a page to be included. Keywords from specific "
+            "clinical categories (Imaging, Therapy, Behavioral Health) contribute more "
+            "to the score than broad administrative categories (Billing, Document "
+            "Sections). A score of 3.0 requires meaningful clinical content — a single "
+            "imaging term alone is not sufficient."
         )
-        form.addRow("Min keyword hits:", self._min_hits_spin)
+        form.addRow("Min weighted score:", self._min_hits_spin)
 
         # Page buffer QSpinBox
         self._page_buffer_spin = QSpinBox()
-        self._page_buffer_spin.setMinimum(2)
+        self._page_buffer_spin.setMinimum(0)
         self._page_buffer_spin.setMaximum(10)
         self._page_buffer_spin.setValue(2)
         self._page_buffer_spin.setToolTip(
@@ -199,6 +208,17 @@ class ScannerDialog(QDialog):
             "pages. Uncheck to restore the default broad-match behaviour."
         )
         form.addRow("", self._doc_section_check)
+
+        # Clinical anchor filter checkbox
+        self._require_anchor_check = QCheckBox("Require clinical category match")
+        self._require_anchor_check.setToolTip(
+            "Only include pages that match at least one clinically specific category "
+            "(Therapy, Medical Treatment, Injury/Legal, Imaging, Behavioral Health, or "
+            "Vocational). Pages that only matched Billing or Document Sections terms "
+            "will be excluded. Recommended when output contains too many administrative "
+            "or billing-only pages."
+        )
+        form.addRow("", self._require_anchor_check)
 
         root.addLayout(form)
 
@@ -254,6 +274,7 @@ class ScannerDialog(QDialog):
             self._min_hits_spin.value(),
             self._page_buffer_spin.value(),
             require,
+            require_anchor=self._require_anchor_check.isChecked(),
         )
         self._worker.progress.connect(self._status_label.setText)
         self._worker.finished.connect(self._on_finished)

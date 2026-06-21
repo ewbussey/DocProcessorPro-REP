@@ -92,16 +92,19 @@ def _extract_dates(text: str) -> list[datetime.date]:
 def _find_tesseract() -> str | None:
     """
     Locate the Tesseract executable. Resolution order:
-    0. PyInstaller bundle  (sys._MEIPASS/tesseract/tesseract.exe)
+    0. PyInstaller bundle  (sys._MEIPASS/tesseract/tesseract[.exe])
     1. TESSERACT_PATH environment variable
     2. Windows registry  HKLM / HKCU  SOFTWARE\\Tesseract-OCR\\InstallDir
-    3. Common installation directories
+    3. Common installation directories (Windows and macOS)
     4. tesseract on PATH (via shutil.which)
     Returns None if not found.
     """
+    _win = sys.platform == "win32"
+    _tess_bin = "tesseract.exe" if _win else "tesseract"
+
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
-        candidate = Path(meipass) / "tesseract" / "tesseract.exe"
+        candidate = Path(meipass) / "tesseract" / _tess_bin
         if candidate.is_file():
             log.debug("Tesseract found in PyInstaller bundle: %s", candidate)
             return str(candidate)
@@ -111,30 +114,41 @@ def _find_tesseract() -> str | None:
         log.debug("Tesseract found via TESSERACT_PATH env var: %s", env)
         return env
 
-    try:
-        import winreg
+    if _win:
+        try:
+            import winreg
 
-        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-            try:
-                with winreg.OpenKey(hive, r"SOFTWARE\Tesseract-OCR") as key:
-                    install_dir, _ = winreg.QueryValueEx(key, "InstallDir")
-                    candidate = Path(install_dir) / "tesseract.exe"
-                    if candidate.is_file():
-                        log.debug("Tesseract found via registry: %s", candidate)
-                        return str(candidate)
-            except OSError:
-                pass
-    except ImportError:
-        pass
+            for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):  # type: ignore[attr-defined]
+                try:
+                    with winreg.OpenKey(hive, r"SOFTWARE\Tesseract-OCR") as key:  # type: ignore[attr-defined]
+                        install_dir, _ = winreg.QueryValueEx(key, "InstallDir")  # type: ignore[attr-defined]
+                        candidate = Path(install_dir) / "tesseract.exe"
+                        if candidate.is_file():
+                            log.debug("Tesseract found via registry: %s", candidate)
+                            return str(candidate)
+                except OSError:
+                    pass
+        except ImportError:
+            pass
 
-    for candidate in (
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-        r"C:\Supporting_Libraries\Tesseract-OCR\tesseract.exe",
-    ):
-        if Path(candidate).is_file():
-            log.debug("Tesseract found at common path: %s", candidate)
-            return candidate
+        for candidate in (
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            r"C:\Supporting_Libraries\Tesseract-OCR\tesseract.exe",
+        ):
+            if Path(candidate).is_file():
+                log.debug("Tesseract found at common Windows path: %s", candidate)
+                return candidate
+
+    elif sys.platform == "darwin":
+        for candidate in (
+            "/opt/homebrew/bin/tesseract",   # Homebrew — Apple Silicon
+            "/usr/local/bin/tesseract",       # Homebrew — Intel
+            "/opt/local/bin/tesseract",       # MacPorts
+        ):
+            if Path(candidate).is_file():
+                log.debug("Tesseract found at common macOS path: %s", candidate)
+                return candidate
 
     on_path = shutil.which("tesseract")
     if on_path:
@@ -148,45 +162,59 @@ def _find_poppler() -> str | None:
     Resolution order:
     0. PyInstaller bundle  (sys._MEIPASS/poppler/)
     1. POPPLER_PATH environment variable (must point to the bin folder)
-    2. Common installation directories (including versioned subdirectories)
+    2. Common installation directories (Windows and macOS)
     3. Returns None if pdftoppm is on PATH (pdf2image handles it)
        or if Poppler cannot be located (OCR will fail gracefully).
     """
+    _win = sys.platform == "win32"
+    _pdftoppm = "pdftoppm.exe" if _win else "pdftoppm"
+
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
         candidate = Path(meipass) / "poppler"
-        if (candidate / "pdftoppm.exe").is_file():
+        if (candidate / _pdftoppm).is_file():
             log.debug("Poppler found in PyInstaller bundle: %s", candidate)
             return str(candidate)
 
     env = os.environ.get("POPPLER_PATH", "")
-    if env and (Path(env) / "pdftoppm.exe").is_file():
+    if env and (Path(env) / _pdftoppm).is_file():
         log.debug("Poppler found via POPPLER_PATH env var: %s", env)
         return env
 
-    search_roots = (
-        Path(r"C:\Program Files\poppler"),
-        Path(r"C:\Program Files (x86)\poppler"),
-        Path(r"C:\poppler"),
-        Path(r"C:\Supporting_Libraries"),
-    )
-    for root in search_roots:
-        if not root.exists():
-            continue
-        # Flat layout:  root/bin/pdftoppm.exe  or  root/Library/bin/pdftoppm.exe
-        for rel in ("bin", "Library/bin"):
-            candidate = root / rel
-            if (candidate / "pdftoppm.exe").is_file():
-                log.debug("Poppler found at: %s", candidate)
-                return str(candidate)
-        # Versioned subdirectories (e.g. poppler-26.02.0/Library/bin) — pick newest
-        subdirs = sorted((d for d in root.iterdir() if d.is_dir()), reverse=True)
-        for sub in subdirs:
+    if _win:
+        search_roots = (
+            Path(r"C:\Program Files\poppler"),
+            Path(r"C:\Program Files (x86)\poppler"),
+            Path(r"C:\poppler"),
+            Path(r"C:\Supporting_Libraries"),
+        )
+        for root in search_roots:
+            if not root.exists():
+                continue
+            # Flat layout:  root/bin/pdftoppm.exe  or  root/Library/bin/pdftoppm.exe
             for rel in ("bin", "Library/bin"):
-                candidate = sub / rel
-                if (candidate / "pdftoppm.exe").is_file():
-                    log.debug("Poppler found at versioned path: %s", candidate)
+                candidate = root / rel
+                if (candidate / _pdftoppm).is_file():
+                    log.debug("Poppler found at: %s", candidate)
                     return str(candidate)
+            # Versioned subdirectories (e.g. poppler-26.02.0/Library/bin) — pick newest
+            subdirs = sorted((d for d in root.iterdir() if d.is_dir()), reverse=True)
+            for sub in subdirs:
+                for rel in ("bin", "Library/bin"):
+                    candidate = sub / rel
+                    if (candidate / _pdftoppm).is_file():
+                        log.debug("Poppler found at versioned path: %s", candidate)
+                        return str(candidate)
+
+    elif sys.platform == "darwin":
+        for bin_dir in (
+            "/opt/homebrew/bin",   # Homebrew — Apple Silicon
+            "/usr/local/bin",       # Homebrew — Intel
+            "/opt/local/bin",       # MacPorts
+        ):
+            if (Path(bin_dir) / _pdftoppm).is_file():
+                log.debug("Poppler found at common macOS path: %s", bin_dir)
+                return bin_dir
 
     if shutil.which("pdftoppm"):
         log.debug("Poppler (pdftoppm) found on PATH — passing poppler_path=None.")
@@ -223,6 +251,7 @@ class KeywordCategory:
     name: str
     keywords: list[str]
     patterns: list[str] = field(default_factory=list)
+    weight: float = 1.0
     _compiled: list[regex.Pattern] = field(default_factory=list, init=False, repr=False)
     _terms: list[str] = field(default_factory=list, init=False, repr=False)
 
@@ -261,7 +290,7 @@ class PageMatch:
     categories: list[str]
     keywords_hit: list[str]
     extraction_method: str  # "pdfplumber" or "ocr"
-    total_hits: int
+    total_hits: float
     dates_on_page: list[str] = field(
         default_factory=list
     )  # ISO dates found on this page
@@ -348,21 +377,13 @@ CATEGORY_THERAPY = KeywordCategory(
         r"\b(hot|cold)\s+pack\b",
         r"\belectrical\s+stim(?:ulation)?\b",
     ],
+    weight=2.0,
 )
 
 CATEGORY_MEDICAL_TREATMENT = KeywordCategory(
     name="MEDICAL_TREATMENT",
     keywords=[
-        "history",
-        "assessment",
-        "plan",
-        "diagnosis",
-        "diagnoses",
         "prognosis",
-        "treatment",
-        "evaluation",
-        "examination",
-        "prescription",
         "medication",
         "dosage",
         "referral",
@@ -376,7 +397,6 @@ CATEGORY_MEDICAL_TREATMENT = KeywordCategory(
         "physical examination",
         "impression",
         "clinical summary",
-        "discharge",
         "discharge summary",
         "discharge instructions",
         "inpatient",
@@ -388,12 +408,7 @@ CATEGORY_MEDICAL_TREATMENT = KeywordCategory(
         "SOAP note",
         "subjective",
         "objective",
-        "vital signs",
-        "blood pressure",
-        "heart rate",
-        "temperature",
         "presenting complaint",
-        "recommend",
         "patient complaint",
         "office visit",
         "consultation",
@@ -405,6 +420,7 @@ CATEGORY_MEDICAL_TREATMENT = KeywordCategory(
     patterns=[
         r"\b[A-Z]\d{2}(?:\.\d{1,4})?\b",
     ],
+    weight=0.8,
 )
 
 CATEGORY_BILLING = KeywordCategory(
@@ -465,12 +481,12 @@ CATEGORY_BILLING = KeywordCategory(
     ],
     patterns=[
         r"(?<!\d)[A-Z]\d{4}(?!\d)",
-        r"\b[A-Z]\d{2}(?:\.\d{1,4})?\b",
         r"\b\d{1,2}/\d{1,2}/\d{2,4}\b",
         r"\b\d{4}-\d{2}-\d{2}\b",
         r"\$\s?\d{1,3}(?:,\d{3})*(?:\.\d{2})?",
         r"\bNPI[:\s#]*\d{10}\b",
     ],
+    weight=0.3,
 )
 
 CATEGORY_INJURY_LEGAL = KeywordCategory(
@@ -537,6 +553,7 @@ CATEGORY_INJURY_LEGAL = KeywordCategory(
         r"\b\d{1,3}%\s+(?:whole\s+person\s+)?impairment\b",
         r"\b(?:claim|case|file)\s*(?:no|number|#)[:\s]*[\w\-]+\b",
     ],
+    weight=1.5,
 )
 
 CATEGORY_IMAGING = KeywordCategory(
@@ -600,6 +617,7 @@ CATEGORY_IMAGING = KeywordCategory(
         r"\b(?:accession|study|exam)\s*(?:no|number|#)[:\s]*[\w\-]+\b",
         r"\bT[12][-\s]weighted\b",
     ],
+    weight=2.5,
 )
 
 CATEGORY_BEHAVIORAL_HEALTH = KeywordCategory(
@@ -660,6 +678,7 @@ CATEGORY_BEHAVIORAL_HEALTH = KeywordCategory(
         r"\b[FZ]\d{2}(?:\.\d{1,4})?\b",
         r"(?<!\d)90[0-9]{3}(?!\d)",
     ],
+    weight=2.0,
 )
 
 CATEGORY_VOCATIONAL = KeywordCategory(
@@ -738,6 +757,7 @@ CATEGORY_VOCATIONAL = KeywordCategory(
         r"\blift(?:ing)?\s+(?:up\s+to\s+)?\d+\s*(?:lbs?|pounds?)\b",
         r"\b(?:stand|sit|walk)\s+(?:up\s+to\s+)?\d+\s*(?:hours?|hrs?)\b",
     ],
+    weight=1.2,
 )
 
 CATEGORY_DOCUMENT_SECTIONS = KeywordCategory(
@@ -869,6 +889,7 @@ CATEGORY_DOCUMENT_SECTIONS = KeywordCategory(
     patterns=[
         r"\b(?:discharge|admission|progress|consultation|attending|physician|operative|procedure|triage|intake|initial)\s+(?:summary|note|report|history|evaluation)\b",
     ],
+    weight=0.3,
 )
 
 DEFAULT_CATEGORIES: list[KeywordCategory] = [
@@ -882,6 +903,17 @@ DEFAULT_CATEGORIES: list[KeywordCategory] = [
     CATEGORY_DOCUMENT_SECTIONS,
 ]
 
+# Categories that indicate genuine clinical content. Used by the require_anchor filter
+# to exclude pages that only matched administrative categories (Billing, Document Sections).
+CLINICAL_ANCHOR_CATEGORIES: frozenset[str] = frozenset({
+    "THERAPY",
+    "MEDICAL_TREATMENT",
+    "INJURY_LEGAL",
+    "IMAGING",
+    "BEHAVIORAL_HEALTH",
+    "VOCATIONAL",
+})
+
 
 # Pages matching any of these patterns are excluded regardless of keyword hits.
 # They identify known-irrelevant page types (nursing flowsheets, MAR sheets, etc.)
@@ -892,6 +924,26 @@ _IRRELEVANT_PAGE_PATTERNS: list[re.Pattern] = [
     re.compile(r"INTAKE\s+(?:AND\s+)?OUTPUT", re.IGNORECASE),
     re.compile(r"VITAL\s+SIGNS\s+FLOW\s*SHEET", re.IGNORECASE),
     re.compile(r"MEDICATION\s+RECONCILIATION", re.IGNORECASE),
+    # Authorization / consent / privacy forms
+    re.compile(r"AUTHORIZATION\s+(?:FOR\s+)?(?:RELEASE|DISCLOSURE)\s+OF\s+(?:PROTECTED\s+)?(?:HEALTH\s+)?(?:INFORMATION|RECORDS)", re.IGNORECASE),
+    re.compile(r"INFORMED\s+CONSENT", re.IGNORECASE),
+    re.compile(r"CONSENT\s+(?:FOR|TO)\s+(?:TREATMENT|PROCEDURE|SURGERY|RELEASE)", re.IGNORECASE),
+    re.compile(r"NOTICE\s+OF\s+PRIVACY\s+PRACTICES", re.IGNORECASE),
+    re.compile(r"HIPAA\s+(?:PRIVACY\s+)?NOTICE", re.IGNORECASE),
+    # Patient registration / demographics
+    re.compile(r"PATIENT\s+(?:DEMOGRAPHICS?|REGISTRATION|INFORMATION\s+SHEET)", re.IGNORECASE),
+    re.compile(r"(?:NEW\s+)?PATIENT\s+INTAKE\s+FORM", re.IGNORECASE),
+    # Scheduling / administrative summaries
+    re.compile(r"APPOINTMENT\s+(?:REMINDER|CONFIRMATION|INSTRUCTIONS)", re.IGNORECASE),
+    re.compile(r"AFTER[- ]?VISIT\s+SUMMARY", re.IGNORECASE),
+    re.compile(r"TABLE\s+OF\s+CONTENTS", re.IGNORECASE),
+    # Financial / billing administrative forms
+    re.compile(r"FINANCIAL\s+RESPONSIBILITY\s+(?:AGREEMENT|FORM|STATEMENT)", re.IGNORECASE),
+    re.compile(r"ASSIGNMENT\s+OF\s+BENEFITS", re.IGNORECASE),
+    # Medication administration pages not caught by MAR pattern
+    re.compile(r"\bACTIVE\s+MEDICATION\s+LIST\b", re.IGNORECASE),
+    # Routine nursing screening tools
+    re.compile(r"FALL\s+RISK\s+(?:ASSESSMENT|SCREENING)", re.IGNORECASE),
 ]
 
 
@@ -901,8 +953,9 @@ _IRRELEVANT_PAGE_PATTERNS: list[re.Pattern] = [
 def scan_pdf(
     pdf_path: str,
     categories: list[KeywordCategory],
-    min_hits: int = 1,
+    min_hits: float = 3.0,
     require_categories: frozenset[str] | None = None,
+    require_anchor: bool = False,
     progress_callback: Callable[[str], None] | None = None,
 ) -> ScanResult:
     """
@@ -978,24 +1031,28 @@ def scan_pdf(
 
         all_keywords: list[str] = []
         matched_categories: list[str] = []
+        weighted_score: float = 0.0
         for cat in categories:
             hits = cat.hits(text)
             if hits:
                 matched_categories.append(cat.name)
                 all_keywords.extend(hits)
-        total = len(all_keywords)
-        passes_min_hits = total >= min_hits
+                weighted_score += cat.weight * len(hits)
+        passes_min_hits = weighted_score >= min_hits
         passes_required = require_categories is None or bool(
             set(matched_categories) & require_categories
         )
-        if passes_min_hits and passes_required:
+        passes_anchor = not require_anchor or bool(
+            set(matched_categories) & CLINICAL_ANCHOR_CATEGORIES
+        )
+        if passes_min_hits and passes_required and passes_anchor:
             matches.append(
                 PageMatch(
                     page_num=i,
                     categories=matched_categories,
                     keywords_hit=all_keywords,
                     extraction_method=method,
-                    total_hits=total,
+                    total_hits=round(weighted_score, 2),
                     dates_on_page=all_page_dates[i],
                 )
             )
@@ -1003,7 +1060,7 @@ def scan_pdf(
 
     unique_dates = sorted(all_dates)
     log.info(
-        "%s: %d / %d pages matched (min_hits=%d). %d unique date(s) found.",
+        "%s: %d / %d pages matched (min_score=%.2f). %d unique date(s) found.",
         path.name,
         len(matches),
         page_count,
@@ -1432,9 +1489,10 @@ def scan_directory(
     input_dir: str,
     output_dir: str,
     categories: list[KeywordCategory],
-    min_hits: int = 1,
+    min_hits: float = 3.0,
     page_buffer: int = 0,
     require_categories: frozenset[str] | None = None,
+    require_anchor: bool = False,
     progress_callback: Callable[[str], None] | None = None,
 ) -> dict[str, list[PageMatch]]:
     """
@@ -1481,6 +1539,7 @@ def scan_directory(
                 categories,
                 min_hits=min_hits,
                 require_categories=require_categories,
+                require_anchor=require_anchor,
                 progress_callback=progress_callback,
             )
         except Exception:
