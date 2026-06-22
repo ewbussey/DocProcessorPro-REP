@@ -1,54 +1,52 @@
-# DocProcessorPro — active pipeline dependencies
-# Generated from pip freeze; trimmed to keyword scanner + GUI + update checker only.
-# Run:  pip install -r requirements.txt
-
-# --- GUI ---
+altgraph==0.17.5
+annotated-types==0.7.0
+certifi==2026.4.22
+cffi==2.0.0
+charset-normalizer==3.4.7
+cryptography==49.0.0
+defusedxml==0.7.1
+deprecation==2.1.0
+-e git+https://github.com/ewbussey/DocProcessorPro-REP.git@6a20556f313da4a917355a76b07bb7ec8f92decb#egg=DocProcessorPro&subdirectory=DocProcessorPro
+fonttools==4.63.0
+fpdf2==2.8.7
+idna==3.13
+img2pdf==0.6.3
+lxml==6.1.1
+macholib==1.16.4
+markdown-it-py==4.2.0
+mdurl==0.1.2
+ocrmypdf==17.7.0
+packaging==26.2
+pdf2image==1.17.0
+pdfminer.six==20251230
+pdfplumber==0.11.9
+pefile==2024.8.26
+pi_heif==1.4.0
+pikepdf==10.9.1
+pillow==12.2.0
+pluggy==1.6.0
+pycparser==3.0
+pydantic==2.13.4
+pydantic_core==2.46.4
+Pygments==2.20.0
+pyinstaller==6.20.0
+pyinstaller-hooks-contrib==2026.5
+pypdf==6.10.2
+pypdfium2==5.7.0
 PySide6==6.11.1
 PySide6_Addons==6.11.1
 PySide6_Essentials==6.11.1
-shiboken6==6.11.1
-
-# --- PDF text extraction ---
-pdfplumber==0.11.9
-pdfminer.six==20251230
-pypdfium2==5.7.0
-
-# --- PDF reading / writing ---
-pypdf==6.10.2
-
-# --- OCR ---
 pytesseract==0.3.13
-pdf2image==1.17.0
-pillow==12.2.0
-
-# --- Logging ---
-PyYAML==6.0.3
 python-json-logger==4.1.0
-
-# --- Keyword matching ---
+PyYAML==6.0.3
 regex==2026.4.4
-
-# --- Update checker ---
 requests==2.33.1
-packaging==26.2
-
-# Transitive — requests
-certifi==2026.4.22
-charset-normalizer==3.4.7
-idna==3.13
-urllib3==2.6.3
-
-# --- Shared runtime transitive ---
-typing_extensions==4.15.0
-
-# --- Build toolchain (not bundled into the app) ---
-pyinstaller==6.20.0
-pyinstaller-hooks-contrib==2026.5
-altgraph==0.17.5
-pefile==2024.8.26
-# pywin32-ctypes==0.2.3
+rich==15.0.0
 setuptools==81.0.0
-
-# --- Type stubs (dev only) ---
+shiboken6==6.11.1
 types-regex==2026.5.9.20260518
 types-requests==2.33.0.20260518
+typing-inspection==0.4.2
+typing_extensions==4.15.0
+uharfbuzz==0.55.0
+urllib3==2.6.3
