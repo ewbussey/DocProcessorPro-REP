@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QSettings, QSize, QThread, QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QImage, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import QColor, QDesktopServices, QImage, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -36,6 +36,18 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+def _apply_win_minmax(dialog: "QDialog") -> None:
+    """Add minimize / maximize buttons on Windows.
+
+    Qt strips them from QDialog title bars by default; this restores the
+    standard Windows chrome without affecting macOS or Linux.
+    """
+    if sys.platform == "win32":
+        dialog.setWindowFlags(
+            dialog.windowFlags() | Qt.WindowType.WindowMinMaxButtonsHint
+        )
+
 
 # BACKGROUND WORKERS
 
@@ -140,6 +152,7 @@ class _UpdateDownloader(QThread):
 class ScannerDialog(QDialog):
     def __init__(self) -> None:
         super().__init__()
+        _apply_win_minmax(self)
         self.setWindowTitle("DocProcessorPro — Keyword Scanner")
         self.setMinimumWidth(520)
         self._worker: _ScanWorker | None = None
@@ -735,6 +748,7 @@ class _DedupDialog(QDialog):
         parent=None,
     ) -> None:
         super().__init__(parent)
+        _apply_win_minmax(self)
         self._groups = groups
         self._cur_decisions = decisions
         self._cur_sources = decision_sources
@@ -742,7 +756,7 @@ class _DedupDialog(QDialog):
         self.setWindowTitle(
             f"Find Duplicates — {len(groups)} group(s), {total} similar pages"
         )
-        self.setMinimumSize(820, 560)
+        self.setMinimumSize(1100, 700)
         self._keep_checks: list[list[tuple[int, QCheckBox]]] = []
         self._build_ui()
 
@@ -804,11 +818,17 @@ class _DedupDialog(QDialog):
                 item_l.setSpacing(2)
                 item_l.setContentsMargins(4, 4, 4, 4)
 
-                pix = QPixmap.fromImage(qimg)
+                # Composite onto a white background so pages with a transparent
+                # alpha layer (common in scanned PDFs) render correctly in dark mode
+                white = QPixmap(qimg.width(), qimg.height())
+                white.fill(Qt.GlobalColor.white)
+                painter = QPainter(white)
+                painter.drawImage(0, 0, qimg)
+                painter.end()
                 thumb = QLabel()
                 thumb.setPixmap(
-                    pix.scaled(
-                        150, 195,
+                    white.scaled(
+                        220, 286,
                         Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.SmoothTransformation,
                     )
@@ -895,6 +915,7 @@ class _ScanSettingsDialog(QDialog):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        _apply_win_minmax(self)
         self.setWindowTitle("Scan Settings")
         self.setMinimumWidth(380)
         self._result: "dict | None" = None
@@ -1011,6 +1032,7 @@ class ReviewDialog(QDialog):
         from pathlib import Path as _Path
 
         super().__init__(parent)
+        _apply_win_minmax(self)
         self._mode = mode
         if mode == "matched":
             self.setWindowTitle("DocProcessorPro — Review Matched Pages")
@@ -1555,8 +1577,15 @@ class ReviewDialog(QDialog):
                     self._decision_sources[idx] = "smart_triage"
                     irr_count += 1
 
-        # Step 4: auto-approve non-therapy clinical pages
-        auto_approve_count = 0
+        # Step 4: auto-approve non-therapy clinical pages, tracking per-category counts
+        _CAT_LABELS: list[tuple[str, str]] = [
+            ("Legal / Affidavit",  "INJURY_LEGAL"),
+            ("Imaging",            "IMAGING"),
+            ("Billing",            "BILLING"),
+            ("Medical Treatment",  "MEDICAL_TREATMENT"),
+            ("Vocational",         "VOCATIONAL"),
+        ]
+        cat_approve_counts: dict[str, int] = {}
         for idx, row in enumerate(self._rows):
             if idx in self._decisions:
                 continue
@@ -1564,24 +1593,49 @@ class ReviewDialog(QDialog):
             if cats & _AUTO_APPROVE_CATS and not (cats & _THERAPY_CATS):
                 self._decisions[idx] = "approved"
                 self._decision_sources[idx] = "smart_triage"
-                auto_approve_count += 1
+                for label, cat_key in _CAT_LABELS:
+                    if cat_key in cats:
+                        cat_approve_counts[label] = cat_approve_counts.get(label, 0) + 1
+                        break
 
         self._refresh_list_colors()
         self._advance_to_next_unreviewed()
         self._triage_decisions = dict(self._decisions)
         self._save_draft()
 
+        # Build summary — skip zero-count lines so each scan mode sees only relevant info
+        summary_lines: list[str] = []
+        if intake_discharge_count:
+            summary_lines.append(
+                f"Therapy — intake / discharge approved:     {intake_discharge_count}"
+            )
+        if fallback_count:
+            summary_lines.append(
+                f"Therapy — first / last progress approved:  {fallback_count}"
+            )
+        if irr_count:
+            summary_lines.append(
+                f"Therapy — remaining progress pre-rejected: {irr_count}"
+            )
+        for label, _ in _CAT_LABELS:
+            count = cat_approve_counts.get(label, 0)
+            if count:
+                summary_lines.append(f"{label} pages approved:{'':>4}{count}")
+        if not summary_lines:
+            summary_lines.append("No pages matched any triage criteria.")
+
+        summary_lines += [
+            "",
+            "Pale blue     = Smart Triage suggested approve.",
+            "Pale lavender = Smart Triage suggested irrelevant.",
+            "Run 'Find Duplicates' for visual duplicate detection.",
+            "",
+            "Review pre-selections and adjust as needed before exporting.",
+        ]
         QMessageBox.information(
             self,
             "Smart Triage Complete",
-            f"Therapy — intake / discharge approved:        {intake_discharge_count}\n"
-            f"Therapy — first / last progress approved:     {fallback_count}\n"
-            f"Therapy — remaining progress pre-rejected:    {irr_count}\n"
-            f"Other clinical pages auto-approved:           {auto_approve_count}\n\n"
-            "Pale blue = Smart Triage suggested approve.\n"
-            "Pale lavender = Smart Triage suggested irrelevant.\n"
-            "Run 'Find Duplicates' for visual duplicate detection.\n\n"
-            "Review pre-selections and adjust as needed before exporting.",
+            "\n".join(summary_lines),
         )
 
     def _run_dedup_pass(self) -> None:
@@ -1616,7 +1670,7 @@ class ReviewDialog(QDialog):
         for idx, row in enumerate(self._rows):
             try:
                 page_0idx = max(0, int(row.get("consolidated_page_num", "1")) - 1)
-                qimg = self._pdf_doc.render(page_0idx, QSize(200, 260))
+                qimg = self._pdf_doc.render(page_0idx, QSize(300, 390))
                 if not qimg.isNull():
                     thumbnails[idx] = qimg
                     hashes.append((idx, _dhash(qimg)))
