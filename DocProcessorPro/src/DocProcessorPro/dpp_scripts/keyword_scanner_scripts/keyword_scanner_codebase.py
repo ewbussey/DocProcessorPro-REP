@@ -377,7 +377,7 @@ CATEGORY_THERAPY = KeywordCategory(
         r"\b(hot|cold)\s+pack\b",
         r"\belectrical\s+stim(?:ulation)?\b",
     ],
-    weight=2.0,
+    weight=1.5,
 )
 
 CATEGORY_MEDICAL_TREATMENT = KeywordCategory(
@@ -420,7 +420,7 @@ CATEGORY_MEDICAL_TREATMENT = KeywordCategory(
     patterns=[
         r"\b[A-Z]\d{2}(?:\.\d{1,4})?\b",
     ],
-    weight=0.8,
+    weight=2.5,
 )
 
 CATEGORY_BILLING = KeywordCategory(
@@ -553,7 +553,7 @@ CATEGORY_INJURY_LEGAL = KeywordCategory(
         r"\b\d{1,3}%\s+(?:whole\s+person\s+)?impairment\b",
         r"\b(?:claim|case|file)\s*(?:no|number|#)[:\s]*[\w\-]+\b",
     ],
-    weight=1.5,
+    weight=1.0,
 )
 
 CATEGORY_IMAGING = KeywordCategory(
@@ -617,7 +617,7 @@ CATEGORY_IMAGING = KeywordCategory(
         r"\b(?:accession|study|exam)\s*(?:no|number|#)[:\s]*[\w\-]+\b",
         r"\bT[12][-\s]weighted\b",
     ],
-    weight=2.5,
+    weight=1.2,
 )
 
 CATEGORY_BEHAVIORAL_HEALTH = KeywordCategory(
@@ -678,7 +678,7 @@ CATEGORY_BEHAVIORAL_HEALTH = KeywordCategory(
         r"\b[FZ]\d{2}(?:\.\d{1,4})?\b",
         r"(?<!\d)90[0-9]{3}(?!\d)",
     ],
-    weight=2.0,
+    weight=1.5,
 )
 
 CATEGORY_VOCATIONAL = KeywordCategory(
@@ -757,139 +757,48 @@ CATEGORY_VOCATIONAL = KeywordCategory(
         r"\blift(?:ing)?\s+(?:up\s+to\s+)?\d+\s*(?:lbs?|pounds?)\b",
         r"\b(?:stand|sit|walk)\s+(?:up\s+to\s+)?\d+\s*(?:hours?|hrs?)\b",
     ],
-    weight=1.2,
+    weight=2.0,
 )
 
-CATEGORY_DOCUMENT_SECTIONS = KeywordCategory(
-    name="Document Sections",
+CATEGORY_DOCUMENT_TYPE = KeywordCategory(
+    name="DOCUMENT_TYPE",
     keywords=[
-        # ER / hospital / medical records
-        "discharge summary",
+        # Hospital / ER records
         "discharge note",
         "history and physical",
         "history & physical",
         "H&P",
-        "chief complaint",
-        "patient complaint",
-        "office visit",
-        "consultation",
-        "consult",
         "consultation note",
         "consult note",
         "consultation report",
-        "progress note",
         "physician note",
         "attending note",
         "attending physician note",
         "admission note",
         "admission history",
         "admitting note",
-        "emergency physician",
         "emergency department note",
-        "ED physician",
         "triage note",
         "intake note",
-        "final diagnosis",
-        "final diagnoses",
-        "discharge diagnosis",
-        "discharge diagnoses",
-        "principal diagnosis",
-        "admitting diagnosis",
-        "condition on discharge",
-        "discharge prescription",
-        "follow-up instructions",
-        "aftercare instructions",
         "operative note",
         "procedure note",
         "surgical note",
-        "post-operative order",
-        "postoperative order",
-        "conclusions",
-        "plan",
-        "assessment",
-        # PT / therapy records
+        # Therapy / rehabilitation
         "initial evaluation",
-        "evaluation",
-        "treatment plan",
-        "plan of care",
-        "care plan",
         "re-evaluation",
-        "functional outcome",
-        "discharge",
         # Imaging
-        "radiology report",
         "imaging report",
-        "interpretation",
-        "impression",
         # Behavioral health
-        "psychiatric evaluation",
-        "mental status examination",
         "psychotherapy note",
         "initial psychiatric",
         "psychological evaluation",
-        "treatment note",
         # Legal / IME
-        "affidavit",
-        "petition",
-        "petition for",
-        "objection to",
-        "objections to",
-        "request for",
-        "requests for",
         "medical legal report",
-        "independent medical evaluation",
-        "IME",
-        "functional capacity evaluation",
-        "FCE",
-        "impairment rating",
-        "narrative report",
-        "work status",
-        "work restrictions",
-        "modified duty",
-        "light duty",
-        "restricted to",
-        "restrict from",
-        # Vocational
-        "vocational assessment",
-        "vocational evaluation",
-        "vocational rehabilitation",
-        "earning capacity",
-        "wage loss",
-        "wage",
-        "work history",
-        "employment history",
-        "job duties",
-        "physical demands",
-        "return to work",
-        "RTW",
-        "job",
-        "paystub",
-        "IRS",
-        "W2",
-        "tax return",
-        "bank statement",
-        "SSA",
-        "1099",
-        "social security",
-        # Billing
-        "invoice",
-        "total price",
-        "billed amount",
-        "billed",
-        "unit price",
-        "balance",
-        "receipt",
-        "payment",
-        "fee",
-        "CPT",
-        "ICD",
-        "HCPCS",
-        "visit code",
     ],
     patterns=[
         r"\b(?:discharge|admission|progress|consultation|attending|physician|operative|procedure|triage|intake|initial)\s+(?:summary|note|report|history|evaluation)\b",
     ],
-    weight=0.3,
+    weight=1.5,
 )
 
 DEFAULT_CATEGORIES: list[KeywordCategory] = [
@@ -900,11 +809,11 @@ DEFAULT_CATEGORIES: list[KeywordCategory] = [
     CATEGORY_IMAGING,
     CATEGORY_BEHAVIORAL_HEALTH,
     CATEGORY_VOCATIONAL,
-    CATEGORY_DOCUMENT_SECTIONS,
+    CATEGORY_DOCUMENT_TYPE,
 ]
 
 # Categories that indicate genuine clinical content. Used by the require_anchor filter
-# to exclude pages that only matched administrative categories (Billing, Document Sections).
+# to exclude pages that only matched administrative categories (Billing).
 CLINICAL_ANCHOR_CATEGORIES: frozenset[str] = frozenset({
     "THERAPY",
     "MEDICAL_TREATMENT",
@@ -912,6 +821,7 @@ CLINICAL_ANCHOR_CATEGORIES: frozenset[str] = frozenset({
     "IMAGING",
     "BEHAVIORAL_HEALTH",
     "VOCATIONAL",
+    "DOCUMENT_TYPE",
 })
 
 

@@ -199,13 +199,14 @@ class ScannerDialog(QDialog):
         )
         form.addRow("Page buffer:", self._page_buffer_spin)
 
-        # Document section filter checkbox
-        self._doc_section_check = QCheckBox("Require document section match")
+        # Document type filter checkbox
+        self._doc_section_check = QCheckBox("Require document type match")
         self._doc_section_check.setToolTip(
-            "Only include pages that are identified as a clinical note, summary, or "
-            "report header (e.g. discharge summary, consultation note, H&P, radiology "
-            "report). Filters out nursing flowsheets, medication lists, and billing "
-            "pages. Uncheck to restore the default broad-match behaviour."
+            "Only include pages that carry a recognizable clinical document-type label "
+            "(e.g. operative note, consultation note, H&P, admission note, psychotherapy "
+            "note, imaging report, medical-legal report). Pages that contain clinical "
+            "content but no explicit document-type header will be excluded, so leave "
+            "unchecked unless output is dominated by untitled pages."
         )
         form.addRow("", self._doc_section_check)
 
@@ -213,10 +214,10 @@ class ScannerDialog(QDialog):
         self._require_anchor_check = QCheckBox("Require clinical category match")
         self._require_anchor_check.setToolTip(
             "Only include pages that match at least one clinically specific category "
-            "(Therapy, Medical Treatment, Injury/Legal, Imaging, Behavioral Health, or "
-            "Vocational). Pages that only matched Billing or Document Sections terms "
-            "will be excluded. Recommended when output contains too many administrative "
-            "or billing-only pages."
+            "(Therapy, Medical Treatment, Injury/Legal, Imaging, Behavioral Health, "
+            "Vocational, or Document Type). Pages that only matched Billing terms will "
+            "be excluded. Recommended when output contains too many administrative or "
+            "billing-only pages."
         )
         form.addRow("", self._require_anchor_check)
 
@@ -264,7 +265,7 @@ class ScannerDialog(QDialog):
         self._status_label.setText("Scanning… this may take a while for large batches.")
 
         require = (
-            frozenset({"Document Sections"})
+            frozenset({"DOCUMENT_TYPE"})
             if self._doc_section_check.isChecked()
             else None
         )
