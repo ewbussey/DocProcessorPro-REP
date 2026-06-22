@@ -27,6 +27,8 @@ import regex
 from pdf2image import convert_from_path
 from PIL import Image, ImageDraw, ImageFont
 
+Image.MAX_IMAGE_PIXELS = 300_000_000  # large-format medical pages at 300 DPI can exceed the 89 MP default
+
 
 log = logging.getLogger(__name__)
 
@@ -810,9 +812,28 @@ CATEGORY_DOCUMENT_TYPE = KeywordCategory(
         "psychological evaluation",
         # Legal / IME
         "medical legal report",
+        # Therapy subtype — intake / initial encounter
+        "initial assessment",
+        "intake assessment",
+        "initial session",
+        "first session",
+        "first visit",
+        "initial visit",
+        # Therapy subtype — discharge / termination
+        "termination note",
+        "termination summary",
+        "termination session",
+        "final session",
+        "final visit",
+        "final note",
+        "treatment termination",
+        "discharge plan",
+        # Therapy subtype — progress notes
+        "session note",
+        "treatment note",
     ],
     patterns=[
-        r"\b(?:discharge|admission|progress|consultation|attending|physician|operative|procedure|triage|intake|initial)\s+(?:summary|note|report|history|evaluation)\b",
+        r"\b(?:discharge|admission|progress|consultation|attending|physician|operative|procedure|triage|intake|initial|termination)\s+(?:summary|note|report|history|evaluation)\b",
     ],
     weight=1.5,
 )
@@ -914,32 +935,44 @@ def scan_pdf(
                 ocr_needed.append(i)
 
     # Pass 2: OCR for pages with insufficient native text.
-    # Render and OCR one page at a time to keep peak memory at ~25 MB per page
-    # rather than loading all pages simultaneously (~25 MB × N pages).
+    # A bounded thread pool (≤4 workers) runs Poppler + Tesseract concurrently across
+    # pages. Peak memory stays at workers × ~25 MB (≤100 MB) regardless of document
+    # size, while a 200-page OCR job runs ~4× faster than a sequential loop.
     if ocr_needed:
         log.debug(
             "%s: %d page(s) below threshold — running OCR.", path.name, len(ocr_needed)
         )
-        for idx, page_num in enumerate(ocr_needed, 1):
-            if progress_callback:
-                progress_callback(
-                    f"{path.name}: OCR page {page_num + 1} ({idx}/{len(ocr_needed)})…"
-                )
-            try:
-                images = convert_from_path(
-                    pdf_path,
-                    poppler_path=_POPPLER_BIN,  # type: ignore[arg-type]
-                    first_page=page_num + 1,
-                    last_page=page_num + 1,
-                    dpi=300,
-                )
-                if images:
-                    text = str(pytesseract.image_to_string(images[0]))
+
+        def _ocr_one_page(page_num: int) -> tuple[int, str]:
+            images = convert_from_path(
+                pdf_path,
+                poppler_path=_POPPLER_BIN,  # type: ignore[arg-type]
+                first_page=page_num + 1,
+                last_page=page_num + 1,
+                dpi=300,
+            )
+            if images:
+                return page_num, str(pytesseract.image_to_string(images[0]))
+            return page_num, page_texts[page_num][0]  # keep native text on empty render
+
+        ocr_workers = min(4, len(ocr_needed))
+        completed_ocr = 0
+        with ThreadPoolExecutor(max_workers=ocr_workers) as ocr_pool:
+            ocr_futures = {ocr_pool.submit(_ocr_one_page, pn): pn for pn in ocr_needed}
+            for fut in as_completed(ocr_futures):
+                completed_ocr += 1
+                if progress_callback:
+                    progress_callback(
+                        f"{path.name}: OCR {completed_ocr}/{len(ocr_needed)} pages…"
+                    )
+                try:
+                    page_num, text = fut.result()
                     page_texts[page_num] = (text, "ocr")
-            except Exception as exc:
-                log.warning(
-                    "Page %d: OCR failed (%s), keeping native text.", page_num, exc
-                )
+                except Exception as exc:
+                    page_num = ocr_futures[fut]
+                    log.warning(
+                        "Page %d: OCR failed (%s), keeping native text.", page_num, exc
+                    )
 
     # Pass 3: keyword matching + date extraction (all pages)
     matches: list[PageMatch] = []
@@ -1281,6 +1314,57 @@ def write_unmatched_manifest(
     log.info("Unmatched manifest written to %s.", out.name)
 
 
+def write_matched_manifest(
+    pdf_path_absolute: str,
+    matches: list[PageMatch],
+    output_csv_path: str,
+    min_hits_threshold: float = 0.0,
+) -> None:
+    """Write a CSV manifest with one row per matched page.
+
+    Mirrors write_unmatched_manifest so ReviewDialog can consume either manifest
+    with the same column set.  exclusion_reasons is always empty for matched pages.
+
+    Columns: source_pdf_path (absolute), page_num (1-indexed), categories_matched,
+    keywords_hit, extraction_method, total_hits, min_hits_threshold,
+    exclusion_reasons, dates_on_page.
+    """
+    out = Path(output_csv_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "source_pdf_path",
+                "page_num",
+                "categories_matched",
+                "keywords_hit",
+                "extraction_method",
+                "total_hits",
+                "min_hits_threshold",
+                "exclusion_reasons",
+                "dates_on_page",
+            ]
+        )
+        for m in sorted(matches, key=lambda x: x.page_num):
+            writer.writerow(
+                [
+                    pdf_path_absolute,
+                    m.page_num + 1,
+                    "|".join(m.categories),
+                    "|".join(m.keywords_hit),
+                    m.extraction_method,
+                    m.total_hits,
+                    min_hits_threshold,
+                    "",  # no exclusion_reasons for matched pages
+                    "|".join(m.dates_on_page),
+                ]
+            )
+
+    log.info("Matched manifest written to %s.", out.name)
+
+
 # CONSOLIDATION HELPERS
 
 _SEPARATOR_FONT_CANDIDATES = (
@@ -1400,15 +1484,21 @@ def consolidate_to_pdf(
     Combine every {stem}_matched.pdf in output_dir into a single _consolidated.pdf,
     inserting a labeled separator page before each source document's pages.
 
+    Also merges every {stem}_matched_manifest.csv into _consolidated_matched_manifest.csv,
+    adding a consolidated_page_num column (1-indexed position within the consolidated PDF)
+    so ReviewDialog can navigate QPdfView directly.
+
     Returns the path of the consolidated PDF, or None if nothing was written.
     """
     out = Path(output_dir)
     writer = pypdf.PdfWriter()
+    all_manifest_rows: list[dict] = []
     included = 0
     current_page = 0
 
     for stem in pdf_stems:
         matched = out / f"{stem}_matched.pdf"
+        matched_csv = out / f"{stem}_matched_manifest.csv"
         if not matched.exists():
             continue
         if progress_callback:
@@ -1423,9 +1513,20 @@ def consolidate_to_pdf(
 
         # Matched pages
         reader = pypdf.PdfReader(str(matched))
+        page_count_for_stem = len(reader.pages)
+        first_content_page = current_page
         for page in reader.pages:
             writer.add_page(page)
             current_page += 1
+
+        # Annotate manifest rows with consolidated_page_num
+        if matched_csv.exists():
+            with open(matched_csv, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            for idx, row in enumerate(rows):
+                if idx < page_count_for_stem:
+                    row["consolidated_page_num"] = first_content_page + idx + 1
+                    all_manifest_rows.append(row)
 
         included += 1
 
@@ -1437,11 +1538,26 @@ def consolidate_to_pdf(
         writer.write(f)
     log.info("Consolidated PDF written to %s (%d source(s)).", dest.name, included)
 
+    # Write consolidated matched manifest
+    if all_manifest_rows:
+        csv_dest = out / "_consolidated_matched_manifest.csv"
+        fieldnames = list(all_manifest_rows[0].keys())
+        with open(csv_dest, "w", newline="", encoding="utf-8") as f:
+            csv_writer = csv.DictWriter(f, fieldnames=fieldnames)
+            csv_writer.writeheader()
+            csv_writer.writerows(all_manifest_rows)
+        log.info(
+            "Consolidated matched manifest written to %s (%d row(s)).",
+            csv_dest.name,
+            len(all_manifest_rows),
+        )
+
     for stem in pdf_stems:
-        individual = out / f"{stem}_matched.pdf"
-        if individual.exists():
-            individual.unlink()
-            log.debug("Removed individual matched PDF: %s", individual.name)
+        for suffix in ("_matched.pdf", "_matched_manifest.csv"):
+            f = out / f"{stem}{suffix}"
+            if f.exists():
+                f.unlink()
+                log.debug("Removed individual matched file: %s", f.name)
 
     return dest
 
@@ -1728,6 +1844,12 @@ def scan_directory(
                 source_date_last=result.source_date_last,
                 source_date_count=result.source_date_count,
             )
+            write_matched_manifest(
+                str(pdf_path),
+                result.matches,
+                str(out_dir / f"{safe_stem}_matched_manifest.csv"),
+                min_hits_threshold=min_hits,
+            )
             write_dates_csv(
                 result.all_page_dates,
                 str(out_dir / f"{safe_stem}_dates.csv"),
@@ -1988,3 +2110,157 @@ def apply_feedback(
         skipped_missing,
     )
     return pages_approved, rejected_count, skipped_missing
+
+
+def apply_matched_feedback(
+    output_dir: str,
+    feedback_path: str,
+    progress_callback: Callable[[str], None] | None = None,
+) -> tuple[int, int, int]:
+    """Remove user-rejected pages from _consolidated.pdf and rebuild it.
+
+    Reads _matched_feedback.jsonl for "exclude" decisions (duplicate or irrelevant),
+    then rebuilds _consolidated.pdf from source PDFs using _consolidated_matched_manifest.csv
+    as the page index, skipping excluded pages.  Pages appended by a prior apply_feedback()
+    call (those not in the matched manifest) are preserved verbatim.
+
+    Args:
+        output_dir:    Directory containing _consolidated.pdf and
+                       _consolidated_matched_manifest.csv.
+        feedback_path: Path to _matched_feedback.jsonl.
+
+    Returns: (pages_kept, pages_removed, pages_skipped_missing_source)
+    """
+    import json
+
+    out = Path(output_dir)
+    fb = Path(feedback_path)
+
+    if not fb.exists():
+        raise FileNotFoundError(f"Matched feedback file not found: {fb}")
+
+    consolidated = out / "_consolidated.pdf"
+    if not consolidated.exists():
+        raise FileNotFoundError(f"Consolidated PDF not found: {consolidated}")
+
+    matched_manifest = out / "_consolidated_matched_manifest.csv"
+    if not matched_manifest.exists():
+        raise FileNotFoundError(
+            f"Consolidated matched manifest not found: {matched_manifest}\n"
+            "Re-run the scan to generate the manifest before using matched review."
+        )
+
+    # Parse feedback — collect excluded pages
+    excluded_keys: set[tuple[str, int]] = set()  # (source_pdf_path, 1-indexed page_num)
+    removed_count = 0
+    for line in fb.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            log.warning("Skipping malformed matched feedback line: %s", line[:80])
+            continue
+        if rec.get("label") == "exclude":
+            src = rec.get("source_pdf_path", "")
+            pg = rec.get("page_num")
+            if src and pg is not None:
+                excluded_keys.add((src, int(pg)))
+                removed_count += 1
+
+    if not excluded_keys:
+        log.info("apply_matched_feedback: no excluded pages — nothing to rebuild.")
+        return 0, 0, 0
+
+    if progress_callback:
+        progress_callback("Rebuilding consolidated matched PDF…")
+
+    # Read manifest to know which original pages to keep
+    with open(matched_manifest, newline="", encoding="utf-8") as f:
+        manifest_rows = list(csv.DictReader(f))
+
+    # Build a set of consolidated_page_nums (1-indexed) that were in the original
+    # matched manifest so we can separate them from appended (post-apply) pages.
+    manifest_consolidated_pages: set[int] = {
+        int(r["consolidated_page_num"]) for r in manifest_rows
+        if r.get("consolidated_page_num")
+    }
+
+    # Determine which original matched pages to keep
+    keep_keys: set[tuple[str, int]] = set()
+    skipped_missing = 0
+    for row in manifest_rows:
+        src = row.get("source_pdf_path", "")
+        pg = int(row.get("page_num", 0))
+        key = (src, pg)
+        if key in excluded_keys:
+            continue
+        if not Path(src).exists():
+            log.warning(
+                "apply_matched_feedback: source PDF missing, skipping page %d from %s",
+                pg, src,
+            )
+            skipped_missing += 1
+            continue
+        keep_keys.add(key)
+
+    # Rebuild: group kept manifest rows by source PDF, preserving source-document order
+    # Then append any pages from the consolidated PDF that were NOT in the original manifest
+    # (i.e. those added by prior apply_feedback calls).
+    pages_kept = 0
+    new_writer = pypdf.PdfWriter()
+
+    # Group manifest rows by source PDF in stem order
+    from collections import OrderedDict
+    stem_to_rows: OrderedDict[str, list[dict]] = OrderedDict()
+    for row in manifest_rows:
+        src = row.get("source_pdf_path", "")
+        if (src, int(row.get("page_num", 0))) in keep_keys:
+            stem_to_rows.setdefault(src, []).append(row)
+
+    for src_path, rows in stem_to_rows.items():
+        sep_buf = _make_separator_page(Path(src_path).name)
+        sep_reader = pypdf.PdfReader(sep_buf)
+        new_writer.add_page(sep_reader.pages[0])
+        src_reader = pypdf.PdfReader(src_path)
+        for row in rows:
+            pn = int(row["page_num"]) - 1  # 0-indexed
+            if 0 <= pn < len(src_reader.pages):
+                new_writer.add_page(src_reader.pages[pn])
+                pages_kept += 1
+
+    # Append pages from consolidated PDF that were not in the matched manifest
+    # (these were added by apply_feedback from unmatched review — keep them unchanged)
+    existing_reader = pypdf.PdfReader(str(consolidated))
+    total_consolidated = len(existing_reader.pages)
+    for page_1idx in range(1, total_consolidated + 1):
+        if page_1idx not in manifest_consolidated_pages:
+            new_writer.add_page(existing_reader.pages[page_1idx - 1])
+
+    tmp = consolidated.with_suffix(".tmp.pdf")
+    with open(tmp, "wb") as f:
+        new_writer.write(f)
+    tmp.replace(consolidated)
+
+    # Update the matched manifest to remove excluded rows
+    remaining_manifest = [
+        r for r in manifest_rows
+        if (r.get("source_pdf_path", ""), int(r.get("page_num", 0))) not in excluded_keys
+    ]
+    if remaining_manifest:
+        fieldnames = list(manifest_rows[0].keys())
+        with open(matched_manifest, "w", newline="", encoding="utf-8") as f:
+            csv_writer = csv.DictWriter(f, fieldnames=fieldnames)
+            csv_writer.writeheader()
+            csv_writer.writerows(remaining_manifest)
+    else:
+        matched_manifest.unlink()
+
+    log.info(
+        "apply_matched_feedback complete: %d kept, %d removed, %d skipped (missing source).",
+        pages_kept,
+        removed_count - skipped_missing,
+        skipped_missing,
+    )
+    return pages_kept, removed_count, skipped_missing

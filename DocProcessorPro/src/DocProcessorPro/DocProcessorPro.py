@@ -11,15 +11,17 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QSettings, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtCore import QPointF, QSettings, QSize, QThread, QTimer, QUrl, Qt, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QImage, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -146,6 +148,8 @@ class ScannerDialog(QDialog):
         self._settings = QSettings("DocProcessorPro", "KeywordScanner")
         self._saved_min_hits: float | None = None
         self._last_output_dir: "Path | None" = None
+        self._last_scan_settings: "dict | None" = None
+        self._last_browsed_dir: str = ""
         self._build_ui()
         # Defer update check until after the event loop starts
         QTimer.singleShot(2000, self._start_update_check)
@@ -203,7 +207,7 @@ class ScannerDialog(QDialog):
         self._page_buffer_spin = QSpinBox()
         self._page_buffer_spin.setMinimum(0)
         self._page_buffer_spin.setMaximum(10)
-        self._page_buffer_spin.setValue(2)
+        self._page_buffer_spin.setValue(5)
         self._page_buffer_spin.setToolTip(
             "Number of pages before and after each keyword hit to include in the output."
         )
@@ -232,7 +236,7 @@ class ScannerDialog(QDialog):
         form.addRow("", self._require_anchor_check)
 
         # Affidavits & bills filter checkbox
-        self._affidavit_bills_check = QCheckBox("Affidavits & bills only")
+        self._affidavit_bills_check = QCheckBox("Affidavits + bills only")
         self._affidavit_bills_check.setToolTip(
             "Only include pages that match the Injury/Legal or Billing categories — "
             "useful for quickly locating sworn statements and billing records within a "
@@ -264,6 +268,25 @@ class ScannerDialog(QDialog):
         )
         self._review_btn.clicked.connect(self._open_review_dialog)
         root.addWidget(self._review_btn)
+
+        # Matched review button — enabled after a scan produces matched output
+        self._matched_review_btn = QPushButton("Review Matched Pages")
+        self._matched_review_btn.setEnabled(False)
+        self._matched_review_btn.setToolTip(
+            "Open the review window to audit pages already in the consolidated output. "
+            "Reject duplicates or irrelevant pages to remove them."
+        )
+        self._matched_review_btn.clicked.connect(self._open_matched_review_dialog)
+        root.addWidget(self._matched_review_btn)
+
+        # Load existing review button — always enabled
+        self._load_review_btn = QPushButton("Load Existing Review…")
+        self._load_review_btn.setToolTip(
+            "Open the review window for a previous scan output folder. "
+            "Select any file inside the output folder (e.g. a PDF or draft JSON)."
+        )
+        self._load_review_btn.clicked.connect(self._load_existing_review)
+        root.addWidget(self._load_review_btn)
 
         # Status label
         self._status_label = QLabel("Ready.")
@@ -301,18 +324,20 @@ class ScannerDialog(QDialog):
     # BROWSE SLOTS
 
     def _browse_input(self) -> None:
-        start = self._input_edit.text().strip()
+        start = self._input_edit.text().strip() or self._last_browsed_dir
         path = QFileDialog.getExistingDirectory(self, "Select Input Folder", start)
         if path:
             self._input_edit.setText(path)
             self._settings.setValue("last_input_dir", path)
+            self._last_browsed_dir = path
 
     def _browse_output(self) -> None:
-        start = self._output_edit.text().strip()
+        start = self._output_edit.text().strip() or self._last_browsed_dir
         path = QFileDialog.getExistingDirectory(self, "Select Output Folder", start)
         if path:
             self._output_edit.setText(path)
             self._settings.setValue("last_output_dir", path)
+            self._last_browsed_dir = path
 
     # SCAN
 
@@ -338,6 +363,26 @@ class ScannerDialog(QDialog):
             require = frozenset({"DOCUMENT_TYPE"})
         else:
             require = None
+
+        # Derive a human-readable mode label for feedback tagging
+        if self._affidavit_bills_check.isChecked():
+            _mode = "affidavits_bills"
+        elif self._doc_section_check.isChecked() and self._require_anchor_check.isChecked():
+            _mode = "document_type_and_anchor"
+        elif self._doc_section_check.isChecked():
+            _mode = "document_type_filter"
+        elif self._require_anchor_check.isChecked():
+            _mode = "clinical_anchor"
+        else:
+            _mode = "standard"
+        self._last_scan_settings = {
+            "scan_mode": _mode,
+            "min_hits": self._min_hits_spin.value(),
+            "page_buffer": self._page_buffer_spin.value(),
+            "require_categories": sorted(require) if require else None,
+            "require_anchor": self._require_anchor_check.isChecked(),
+        }
+
         self._worker = _ScanWorker(
             input_dir,
             output_dir,
@@ -368,6 +413,11 @@ class ScannerDialog(QDialog):
             self._review_btn.setText(
                 f"Review Excluded Pages ({exclusion_count} to review)"
             )
+        if match_count > 0:
+            self._matched_review_btn.setEnabled(True)
+            self._matched_review_btn.setText(
+                f"Review Matched Pages ({match_count} matched)"
+            )
 
     def _open_review_dialog(self) -> None:
         if self._last_output_dir is None:
@@ -385,8 +435,124 @@ class ScannerDialog(QDialog):
                 "Run a scan that produces reviewable exclusions first.",
             )
             return
-        dlg = ReviewDialog(pdf_path, csv_path, self._last_output_dir, parent=self)
+        dlg = ReviewDialog(
+            pdf_path, csv_path, self._last_output_dir,
+            scan_settings=self._last_scan_settings,
+            parent=self,
+        )
+        self._run_review_dialog(dlg)
+
+    def _open_matched_review_dialog(self) -> None:
+        if self._last_output_dir is None:
+            QMessageBox.warning(
+                self, "No Scan Data", "Run a scan first to generate review data."
+            )
+            return
+        pdf_path = self._last_output_dir / "_consolidated.pdf"
+        csv_path = self._last_output_dir / "_consolidated_matched_manifest.csv"
+        if not pdf_path.exists():
+            QMessageBox.warning(
+                self,
+                "No Consolidated PDF Found",
+                "No _consolidated.pdf found. Run a scan that produces matches first.",
+            )
+            return
+        if not csv_path.exists():
+            QMessageBox.warning(
+                self,
+                "No Matched Manifest Found",
+                "_consolidated_matched_manifest.csv not found.\n\n"
+                "Re-run the scan to generate the manifest required for matched review.",
+            )
+            return
+        dlg = ReviewDialog(
+            pdf_path, csv_path, self._last_output_dir,
+            scan_settings=self._last_scan_settings,
+            mode="matched",
+            parent=self,
+        )
+        self._run_review_dialog(dlg)
+
+    def _load_existing_review(self) -> None:
+        start = (
+            self._output_edit.text().strip()
+            or self._input_edit.text().strip()
+            or self._last_browsed_dir
+        )
+        # File picker: user selects any file inside the output folder.
+        # The output folder is derived from the selected file's parent.
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Any File in Scan Output Folder",
+            start,
+            "Review files (*_consolidated_unmatched.pdf *_consolidated.pdf "
+            "*_review_draft.json *_matched_review_draft.json *_feedback.jsonl);;"
+            "All files (*)",
+        )
+        if not selected:
+            return
+        output_dir = Path(selected).parent
+        self._last_browsed_dir = str(output_dir)
+
+        # Auto-detect which review to open based on filename selected
+        selected_name = Path(selected).name
+        open_matched = (
+            selected_name in ("_consolidated.pdf", "_matched_review_draft.json",
+                              "_matched_feedback.jsonl")
+            or selected_name.endswith("_matched_manifest.csv")
+        )
+
+        if open_matched:
+            pdf_path = output_dir / "_consolidated.pdf"
+            csv_path = output_dir / "_consolidated_matched_manifest.csv"
+            if not pdf_path.exists():
+                QMessageBox.warning(self, "No Consolidated PDF Found",
+                    "No _consolidated.pdf found in the selected folder.")
+                return
+            if not csv_path.exists():
+                QMessageBox.warning(self, "No Matched Manifest Found",
+                    "_consolidated_matched_manifest.csv not found.\n\n"
+                    "Re-run the scan to generate this manifest.")
+                return
+            settings_dlg = _ScanSettingsDialog(parent=self)
+            if settings_dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            dlg = ReviewDialog(
+                pdf_path, csv_path, output_dir,
+                scan_settings=settings_dlg.scan_settings,
+                mode="matched",
+                parent=self,
+            )
+        else:
+            pdf_path = output_dir / "_consolidated_unmatched.pdf"
+            csv_path = output_dir / "_consolidated_unmatched_manifest.csv"
+            if not pdf_path.exists():
+                QMessageBox.warning(self, "No Unmatched PDF Found",
+                    "No _consolidated_unmatched.pdf found in the selected folder.\n\n"
+                    "Please select a file inside a folder that contains scan output.")
+                return
+            settings_dlg = _ScanSettingsDialog(parent=self)
+            if settings_dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            dlg = ReviewDialog(
+                pdf_path, csv_path, output_dir,
+                scan_settings=settings_dlg.scan_settings,
+                parent=self,
+            )
+        self._run_review_dialog(dlg)
+
+    def _run_review_dialog(self, dlg: "ReviewDialog") -> None:
+        """Execute a ReviewDialog and update the status label if Apply was used."""
         dlg.exec()
+        if dlg._apply_result is not None:
+            primary, skipped = dlg._apply_result
+            if dlg._mode == "matched":
+                msg = f"Review complete — {primary} page(s) kept in consolidated output."
+            else:
+                msg = f"Review complete — {primary} page(s) applied to consolidated output."
+            if skipped:
+                msg += f" ({skipped} page(s) skipped — source file(s) not found.)"
+            self._status_label.setText(msg)
 
     def _on_error(self, message: str) -> None:
         self._run_btn.setEnabled(True)
@@ -432,69 +598,456 @@ class ScannerDialog(QDialog):
 
 
 class _FeedbackWorker(QThread):
-    """Runs apply_feedback() off the main thread."""
+    """Runs apply_feedback() or apply_matched_feedback() off the main thread."""
 
     progress = Signal(str)
-    finished = Signal(int, int, int)  # (pages_approved, pages_rejected, pages_skipped)
+    finished = Signal(int, int, int)  # (pages_approved_or_kept, pages_rejected, pages_skipped)
     error = Signal(str)
 
-    def __init__(self, output_dir: str, feedback_path: str) -> None:
+    def __init__(
+        self,
+        output_dir: str,
+        feedback_path: str,
+        mode: str = "unmatched",
+    ) -> None:
         super().__init__()
         self._output_dir = output_dir
         self._feedback_path = feedback_path
+        self._mode = mode
 
     def run(self) -> None:
         try:
-            from DocProcessorPro.dpp_scripts.keyword_scanner_scripts.keyword_scanner_codebase import (
-                apply_feedback,
-            )
-
-            approved, rejected, skipped = apply_feedback(
-                self._output_dir,
-                self._feedback_path,
-                progress_callback=self.progress.emit,
-            )
-            self.finished.emit(approved, rejected, skipped)
+            if self._mode == "matched":
+                from DocProcessorPro.dpp_scripts.keyword_scanner_scripts.keyword_scanner_codebase import (
+                    apply_matched_feedback,
+                )
+                kept, removed, skipped = apply_matched_feedback(
+                    self._output_dir,
+                    self._feedback_path,
+                    progress_callback=self.progress.emit,
+                )
+                self.finished.emit(kept, removed, skipped)
+            else:
+                from DocProcessorPro.dpp_scripts.keyword_scanner_scripts.keyword_scanner_codebase import (
+                    apply_feedback,
+                )
+                approved, rejected, skipped = apply_feedback(
+                    self._output_dir,
+                    self._feedback_path,
+                    progress_callback=self.progress.emit,
+                )
+                self.finished.emit(approved, rejected, skipped)
         except Exception as exc:
             self.error.emit(str(exc))
 
 
-class ReviewDialog(QDialog):
-    """Three-panel review window for auditing keyword-scanner exclusions.
+# Therapy triage classification constants — module level so they're computed once
+_THERAPY_CATS: frozenset[str] = frozenset({"THERAPY", "BEHAVIORAL_HEALTH"})
+_INTAKE_KW: frozenset[str] = frozenset({
+    "initial evaluation", "intake note", "intake assessment",
+    "initial assessment", "initial session", "first session",
+    "first visit", "initial visit", "initial psychiatric",
+    "psychological evaluation", "evaluation and management",
+    # regex-produced verbatim matches from CATEGORY_DOCUMENT_TYPE pattern:
+    "initial summary", "initial note", "initial report",
+    "initial history", "intake summary", "intake report",
+})
+_DISCHARGE_KW: frozenset[str] = frozenset({
+    "discharge note", "discharge summary", "termination note",
+    "termination summary", "termination session", "final session",
+    "final visit", "final note", "treatment termination", "discharge plan",
+    # regex-produced:
+    "discharge report", "discharge history", "termination report",
+})
+# Non-therapy clinical categories that are auto-approved when unique
+_AUTO_APPROVE_CATS: frozenset[str] = frozenset({
+    "IMAGING", "INJURY_LEGAL", "VOCATIONAL", "BILLING", "MEDICAL_TREATMENT"
+})
 
-    Left:   list of excluded pages sorted by score descending
-    Centre: QPdfView showing the consolidated unmatched PDF
+# Background colors keyed by (decision, decision_source)
+_DECISION_COLORS: dict[tuple[str, str], tuple[int, int, int]] = {
+    ("approved",            "user"):                 (200, 255, 200),  # green
+    ("rejected_duplicate",  "user"):                 (255, 210, 140),  # orange
+    ("rejected_irrelevant", "user"):                 (255, 200, 200),  # red
+    ("approved",            "smart_triage"):         (185, 215, 255),  # pale blue
+    ("rejected_duplicate",  "smart_triage"):         (255, 255, 185),  # pale yellow
+    ("rejected_irrelevant", "smart_triage"):         (235, 205, 255),  # pale lavender
+    ("approved",            "find_duplicates"):      (200, 255, 200),  # same green
+    ("rejected_duplicate",  "find_duplicates"):      (255, 225, 190),  # pale peach
+    ("rejected_irrelevant", "find_duplicates"):      (255, 200, 200),  # same red
+    ("approved",            "matched_mode_default"): (200, 235, 255),  # pale cyan
+    ("rejected_duplicate",  "matched_mode_default"): (255, 210, 140),  # orange
+    ("rejected_irrelevant", "matched_mode_default"): (255, 200, 200),  # red
+}
+
+
+def _dhash(qimage: "QImage") -> int:
+    """64-bit difference hash: horizontal gradient over a 9×8 grayscale thumbnail."""
+    gray = qimage.convertToFormat(QImage.Format.Format_Grayscale8).scaled(
+        QSize(9, 8), Qt.AspectRatioMode.IgnoreAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    bits = gray.bits()
+    h = 0
+    for row in range(8):
+        for col in range(8):
+            h = (h << 1) | (1 if bits[row * 9 + col] > bits[row * 9 + col + 1] else 0)
+    return h
+
+
+def _hamming(a: int, b: int) -> int:
+    return bin(a ^ b).count("1")
+
+
+def _cluster_by_hash(
+    hashes: list[tuple[int, int]], threshold: int = 10
+) -> list[list[int]]:
+    """Greedy clustering: each item joins the first cluster within Hamming threshold."""
+    clusters: list[list[int]] = []
+    representatives: list[int] = []
+    for idx, h in hashes:
+        placed = False
+        for c_i, rep_h in enumerate(representatives):
+            if _hamming(h, rep_h) <= threshold:
+                clusters[c_i].append(idx)
+                placed = True
+                break
+        if not placed:
+            clusters.append([idx])
+            representatives.append(h)
+    return clusters
+
+
+class _DedupDialog(QDialog):
+    """Side-by-side comparison dialog for groups of visually similar pages.
+
+    Each group shows page thumbnails with source / page / score info and a
+    'Keep' checkbox. Default: the highest-scored already-approved page in each
+    group is checked; all others are unchecked (will be marked rejected_duplicate
+    on Apply). The user can override any checkbox before confirming.
+    """
+
+    def __init__(
+        self,
+        groups: list[list[tuple[int, dict, "QImage"]]],
+        decisions: dict[int, str],
+        decision_sources: dict[int, str],
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._groups = groups
+        self._cur_decisions = decisions
+        self._cur_sources = decision_sources
+        total = sum(len(g) for g in groups)
+        self.setWindowTitle(
+            f"Find Duplicates — {len(groups)} group(s), {total} similar pages"
+        )
+        self.setMinimumSize(820, 560)
+        self._keep_checks: list[list[tuple[int, QCheckBox]]] = []
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        total = sum(len(g) for g in self._groups)
+        header = QLabel(
+            f"Found {len(self._groups)} group(s) of visually similar pages "
+            f"({total} pages total).\n"
+            "Check pages to keep as approved; uncheck to mark as duplicate. "
+            "The highest-scored page in each group is pre-selected."
+        )
+        header.setWordWrap(True)
+        root.addWidget(header)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.setSpacing(16)
+
+        for g_idx, group in enumerate(self._groups):
+            # Prefer already-approved pages as the default canonical
+            approved = [t for t in group if self._cur_decisions.get(t[0]) == "approved"]
+            if approved:
+                canonical_idx = max(
+                    approved, key=lambda t: float(t[1].get("total_hits", 0))
+                )[0]
+            else:
+                canonical_idx = max(
+                    group, key=lambda t: float(t[1].get("total_hits", 0))
+                )[0]
+
+            frame = QFrame()
+            frame.setFrameShape(QFrame.Shape.Box)
+            frame.setFrameShadow(QFrame.Shadow.Sunken)
+            frame_layout = QVBoxLayout(frame)
+            frame_layout.setContentsMargins(8, 8, 8, 8)
+            frame_layout.setSpacing(4)
+
+            grp_label = QLabel(f"Group {g_idx + 1}")
+            grp_label.setStyleSheet("font-weight: bold; font-size: 11px;")
+            frame_layout.addWidget(grp_label)
+
+            items_row = QHBoxLayout()
+            items_row.setSpacing(12)
+            checks: list[tuple[int, QCheckBox]] = []
+
+            for row_idx, row, qimg in sorted(
+                group,
+                key=lambda t: float(t[1].get("total_hits", 0)),
+                reverse=True,
+            ):
+                item_w = QWidget()
+                item_l = QVBoxLayout(item_w)
+                item_l.setSpacing(2)
+                item_l.setContentsMargins(4, 4, 4, 4)
+
+                pix = QPixmap.fromImage(qimg)
+                thumb = QLabel()
+                thumb.setPixmap(
+                    pix.scaled(
+                        150, 195,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+                thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                item_l.addWidget(thumb)
+
+                src_path = row.get("source_pdf_path", "")
+                filename = src_path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                score = float(row.get("total_hits", 0))
+                pg = row.get("page_num", "?")
+                cur_dec = self._cur_decisions.get(row_idx)
+                cur_src = self._cur_sources.get(row_idx, "—")
+                status = (
+                    f"{cur_dec} ({cur_src})" if cur_dec else "undecided"
+                )
+                info = QLabel(f"{filename}\np.{pg}  score {score:.2f}\n{status}")
+                info.setWordWrap(True)
+                info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                item_l.addWidget(info)
+
+                chk = QCheckBox("Keep")
+                chk.setChecked(row_idx == canonical_idx)
+                item_l.addWidget(chk, 0, Qt.AlignmentFlag.AlignHCenter)
+                checks.append((row_idx, chk))
+                items_row.addWidget(item_w)
+
+            items_row.addStretch()
+            frame_layout.addLayout(items_row)
+
+            btn_row = QHBoxLayout()
+            btn_row.addStretch()
+            best_btn = QPushButton("Keep Highest Scored")
+            best_btn.clicked.connect(
+                lambda _, c=checks: [chk.setChecked(i == 0) for i, (_, chk) in enumerate(c)]
+            )
+            btn_row.addWidget(best_btn)
+            frame_layout.addLayout(btn_row)
+
+            self._keep_checks.append(checks)
+            inner_layout.addWidget(frame)
+
+        inner_layout.addStretch()
+        scroll.setWidget(inner)
+        root.addWidget(scroll)
+
+        bottom = QHBoxLayout()
+        bottom.addStretch()
+        apply_btn = QPushButton("Apply Selections")
+        apply_btn.setDefault(True)
+        apply_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel (no changes)")
+        cancel_btn.clicked.connect(self.reject)
+        bottom.addWidget(apply_btn)
+        bottom.addWidget(cancel_btn)
+        root.addLayout(bottom)
+
+    def results(self) -> tuple[list[int], list[int]]:
+        """Return (keep_indices, reject_indices) based on checkbox state."""
+        keep: list[int] = []
+        reject: list[int] = []
+        for checks in self._keep_checks:
+            for row_idx, chk in checks:
+                (keep if chk.isChecked() else reject).append(row_idx)
+        return keep, reject
+
+
+class _ScanSettingsDialog(QDialog):
+    """Prompts the user for the scan settings that produced an existing output folder.
+
+    Used when loading a prior review session so exported feedback can be tagged
+    with the correct scan profile. All fields default to the most common values;
+    the user may leave the mode as 'Don't specify' to pass scan_settings=None.
+    """
+
+    _MODE_ITEMS: list[tuple[str, "str | None"]] = [
+        ("Don't specify",                    None),
+        ("Standard (full clinical scan)",    "standard"),
+        ("Affidavits + Bills only",          "affidavits_bills"),
+        ("Document type filter",             "document_type_filter"),
+        ("Clinical anchor required",         "clinical_anchor"),
+        ("Document type + clinical anchor",  "document_type_and_anchor"),
+    ]
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Scan Settings")
+        self.setMinimumWidth(380)
+        self._result: "dict | None" = None
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+        root.setContentsMargins(16, 16, 16, 16)
+
+        note = QLabel(
+            "Specify the scan settings used to produce this output folder.\n"
+            "This tags exported feedback for accurate training-data partitioning.\n"
+            "Select 'Don't specify' if the original settings are unknown."
+        )
+        note.setWordWrap(True)
+        root.addWidget(note)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        self._mode_combo = QComboBox()
+        for label, _ in self._MODE_ITEMS:
+            self._mode_combo.addItem(label)
+        self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        form.addRow("Scan mode:", self._mode_combo)
+
+        self._min_hits_spin = QDoubleSpinBox()
+        self._min_hits_spin.setMinimum(0.3)
+        self._min_hits_spin.setMaximum(100.0)
+        self._min_hits_spin.setSingleStep(0.5)
+        self._min_hits_spin.setValue(3.0)
+        form.addRow("Min weighted score:", self._min_hits_spin)
+
+        self._page_buffer_spin = QSpinBox()
+        self._page_buffer_spin.setMinimum(0)
+        self._page_buffer_spin.setMaximum(10)
+        self._page_buffer_spin.setValue(5)
+        form.addRow("Page buffer:", self._page_buffer_spin)
+
+        root.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        ok_btn = QPushButton("OK")
+        ok_btn.setDefault(True)
+        ok_btn.clicked.connect(self._on_ok)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(ok_btn)
+        btn_row.addWidget(cancel_btn)
+        root.addLayout(btn_row)
+
+    def _on_mode_changed(self, index: int) -> None:
+        mode = self._MODE_ITEMS[index][1]
+        if mode == "affidavits_bills":
+            self._min_hits_spin.setValue(0.3)
+            self._min_hits_spin.setEnabled(False)
+        else:
+            self._min_hits_spin.setEnabled(True)
+            if self._min_hits_spin.value() == 0.3:
+                self._min_hits_spin.setValue(3.0)
+
+    def _on_ok(self) -> None:
+        mode = self._MODE_ITEMS[self._mode_combo.currentIndex()][1]
+        if mode is None:
+            self._result = None
+        else:
+            _require: "dict[str, tuple[list[str] | None, bool]]" = {
+                "standard":                  (None,                          False),
+                "affidavits_bills":          (["BILLING", "INJURY_LEGAL"],   False),
+                "document_type_filter":      (["DOCUMENT_TYPE"],             False),
+                "clinical_anchor":           (None,                          True),
+                "document_type_and_anchor":  (["DOCUMENT_TYPE"],             True),
+            }
+            require_categories, require_anchor = _require[mode]
+            self._result = {
+                "scan_mode":          mode,
+                "min_hits":           self._min_hits_spin.value(),
+                "page_buffer":        self._page_buffer_spin.value(),
+                "require_categories": require_categories,
+                "require_anchor":     require_anchor,
+            }
+        self.accept()
+
+    @property
+    def scan_settings(self) -> "dict | None":
+        return self._result
+
+
+class ReviewDialog(QDialog):
+    """Three-panel review window for auditing keyword-scanner page decisions.
+
+    mode="unmatched" (default): review excluded pages; approve to move to consolidated.
+    mode="matched": review matched pages already in consolidated; reject to remove.
+
+    Left:   list of pages sorted by score descending
+    Centre: QPdfView showing the consolidated PDF
     Right:  metadata panel + Approve / Reject / Skip buttons
 
-    Keyboard shortcuts: A = approve, R = reject, S = skip.
+    Keyboard shortcuts: A = approve, D = duplicate, R = irrelevant, S = skip.
     After each decision the view auto-advances to the next unreviewed page.
     """
 
     def __init__(
         self,
-        consolidated_unmatched_pdf: "Path",
-        unmatched_manifest_csv: "Path",
+        review_pdf: "Path",
+        manifest_csv: "Path",
         output_dir: "Path",
+        scan_settings: "dict | None" = None,
+        mode: str = "unmatched",
         parent=None,
     ) -> None:
         from pathlib import Path as _Path
 
         super().__init__(parent)
-        self.setWindowTitle("DocProcessorPro — Review Excluded Pages")
+        self._mode = mode
+        if mode == "matched":
+            self.setWindowTitle("DocProcessorPro — Review Matched Pages")
+        else:
+            self.setWindowTitle("DocProcessorPro — Review Excluded Pages")
         self.setMinimumSize(1100, 700)
 
         self._output_dir = _Path(output_dir)
-        self._feedback_path = self._output_dir / "_feedback.jsonl"
+        if mode == "matched":
+            self._feedback_path = self._output_dir / "_matched_feedback.jsonl"
+            self._draft_path    = self._output_dir / "_matched_review_draft.json"
+        else:
+            self._feedback_path = self._output_dir / "_feedback.jsonl"
+            self._draft_path    = self._output_dir / "_review_draft.json"
         self._fb_worker: _FeedbackWorker | None = None
+        self._scan_settings: "dict | None" = scan_settings
+        self._apply_result: "tuple[int, int] | None" = None  # (approved, skipped) set on successful apply
 
         self._rows: list[dict] = []
-        self._decisions: dict[int, str] = {}  # row_index → "approved" | "rejected"
+        self._subtypes: list[str | None] = []  # parallel to _rows
+        self._decisions: dict[int, str] = {}         # row_index → "approved" | "rejected_*"
+        self._triage_decisions: dict[int, str] = {}  # snapshot after Smart Triage runs
+        self._decision_sources: dict[int, str] = {}  # row_index → "user"|"smart_triage"|"find_duplicates"|"matched_mode_default"
+        self._dedup_groups: dict[int, int] = {}      # row_index → cluster id from last Find Duplicates run
+        self._dedup_canonical: set[int] = set()      # indices identified as canonical in their dedup cluster
         self._current_index: int = -1
 
-        self._load_manifest(unmatched_manifest_csv)
+        self._load_manifest(manifest_csv)
+        # Matched mode: pre-approve every page (already in consolidated; user marks removals)
+        if self._mode == "matched":
+            for i in range(len(self._rows)):
+                self._decisions[i] = "approved"
+                self._decision_sources[i] = "matched_mode_default"
         self._build_ui()
-        self._load_pdf(consolidated_unmatched_pdf)
+        self._load_pdf(review_pdf)
         self._load_existing_feedback()
+        self._load_draft()  # overlay any newer in-progress decisions from auto-save
 
         if self._rows:
             self._select_row(0)
@@ -508,10 +1061,12 @@ class ReviewDialog(QDialog):
             return
         with open(csv_path, newline="", encoding="utf-8") as f:
             rows = list(_csv.DictReader(f))
-        # Sort highest score first so the most-interesting pages appear at top
+        # Sort by source PDF then page number so whole records appear in sequence
         self._rows = sorted(
-            rows, key=lambda r: float(r.get("total_hits", 0)), reverse=True
+            rows,
+            key=lambda r: (r.get("source_pdf_path", ""), int(r.get("page_num", 0))),
         )
+        self._subtypes = [self._classify_subtype(row) for row in self._rows]
 
     def _load_pdf(self, pdf_path: "Path") -> None:
         try:
@@ -542,18 +1097,134 @@ class ReviewDialog(QDialog):
             label = rec.get("label", "")
             if not (src and pg and label in ("include", "exclude")):
                 continue
-            # Match to a row by source_pdf_path + page_num
+            if label == "include":
+                decision = "approved"
+            else:
+                reason = rec.get("rejection_reason", "irrelevant")
+                decision = (
+                    "rejected_duplicate" if reason == "duplicate" else "rejected_irrelevant"
+                )
+            source = rec.get("decision_source", "user")
             for idx, row in enumerate(self._rows):
                 if (
                     row.get("source_pdf_path") == src
                     and int(row.get("page_num", 0)) == int(pg)
                 ):
-                    self._decisions[idx] = (
-                        "approved" if label == "include" else "rejected"
-                    )
+                    self._decisions[idx] = decision
+                    self._decision_sources[idx] = source
                     break
         self._refresh_list_colors()
         self._update_toolbar()
+
+    def _save_draft(self) -> None:
+        """Persist current decisions to a draft file after every change.
+
+        Keyed by "source_pdf_path|page_num" so the draft survives list re-sorts.
+        Uses an atomic rename so a crash mid-write never leaves a corrupt file.
+        """
+        import json
+
+        def _to_stable(d: dict) -> dict:
+            out: dict = {}
+            for idx, val in d.items():
+                row = self._rows[idx]
+                key = f"{row.get('source_pdf_path', '')}|{row.get('page_num', '')}"
+                out[key] = val
+            return out
+
+        # Dedup canonical set → stable keys list
+        dedup_canonical_keys = [
+            f"{self._rows[i].get('source_pdf_path', '')}|{self._rows[i].get('page_num', '')}"
+            for i in self._dedup_canonical
+            if i < len(self._rows)
+        ]
+
+        draft = {
+            "decisions":            _to_stable(self._decisions),
+            "triage_decisions":     _to_stable(self._triage_decisions),
+            "decision_sources":     _to_stable(self._decision_sources),
+            "dedup_group_ids":      _to_stable(self._dedup_groups),
+            "dedup_canonical_keys": dedup_canonical_keys,
+        }
+        tmp = self._draft_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(draft), encoding="utf-8")
+        tmp.replace(self._draft_path)
+
+    def _load_draft(self) -> None:
+        """Overlay in-progress decisions from the auto-save draft.
+
+        Called after _load_existing_feedback() so the draft (always more recent)
+        takes precedence over the last explicit export.
+        Supports both the current nested format and the legacy flat format.
+        """
+        import json
+
+        if not self._draft_path.exists():
+            return
+        try:
+            raw: dict = json.loads(self._draft_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+
+        # Detect format: nested (current) vs. legacy flat
+        if "decisions" in raw and isinstance(raw["decisions"], dict):
+            decisions_map: dict = raw["decisions"]
+            triage_map: dict = raw.get("triage_decisions", {})
+            sources_map: dict = raw.get("decision_sources", {})
+            dedup_groups_map: dict = raw.get("dedup_group_ids", {})
+            dedup_canonical_keys: list = raw.get("dedup_canonical_keys", [])
+        else:
+            decisions_map = raw  # legacy flat
+            triage_map = {}
+            sources_map = {}
+            dedup_groups_map = {}
+            dedup_canonical_keys = []
+
+        # Build stable-key → index lookup for current row order
+        key_to_idx: dict[str, int] = {}
+        for idx, row in enumerate(self._rows):
+            key = f"{row.get('source_pdf_path', '')}|{row.get('page_num', '')}"
+            key_to_idx[key] = idx
+
+        restored = 0
+        for key, decision in decisions_map.items():
+            idx = key_to_idx.get(key)
+            if idx is not None and self._decisions.get(idx) != decision:
+                self._decisions[idx] = decision
+                restored += 1
+
+        for key, decision in triage_map.items():
+            idx = key_to_idx.get(key)
+            if idx is not None:
+                self._triage_decisions[idx] = decision
+
+        for key, source in sources_map.items():
+            idx = key_to_idx.get(key)
+            if idx is not None:
+                self._decision_sources[idx] = source
+
+        for key, group_id in dedup_groups_map.items():
+            idx = key_to_idx.get(key)
+            if idx is not None:
+                self._dedup_groups[idx] = group_id
+
+        self._dedup_canonical = {
+            key_to_idx[k] for k in dedup_canonical_keys if k in key_to_idx
+        }
+
+        if restored:
+            self._refresh_list_colors()
+            self._update_toolbar()
+            QTimer.singleShot(
+                200,
+                lambda: QMessageBox.information(
+                    self,
+                    "Session Restored",
+                    f"Restored {restored} unsaved decision(s) from your last session.\n\n"
+                    "Your progress was automatically saved and is ready to continue.\n"
+                    "Click 'Export Feedback' to commit these decisions permanently.",
+                ),
+            )
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -565,15 +1236,44 @@ class ReviewDialog(QDialog):
         self._progress_label = QLabel("0 approved / 0 rejected / 0 remaining")
         toolbar.addWidget(self._progress_label)
         toolbar.addStretch()
+        dedup_btn = QPushButton("Find Duplicates")
+        dedup_btn.setToolTip(
+            "Render all pages and detect visually similar groups using perceptual hashing. "
+            "Runs across all pages regardless of current decision state."
+        )
+        dedup_btn.clicked.connect(self._run_dedup_pass)
+        toolbar.addWidget(dedup_btn)
+        triage_btn = QPushButton("Smart Triage")
+        triage_btn.setToolTip(
+            "Auto-categorize therapy pages (intake/discharge/progress fallback) "
+            "and approve non-therapy clinical pages. "
+            "Run Find Duplicates first for visual dedup."
+        )
+        triage_btn.clicked.connect(self._run_smart_triage)
+        toolbar.addWidget(triage_btn)
+        self._filter_btn = QPushButton("Approved + Duplicates")
+        self._filter_btn.setCheckable(True)
+        self._filter_btn.setToolTip(
+            "Show only approved and duplicate-flagged pages — "
+            "helps spot pages that were approved but should be marked as duplicates."
+        )
+        self._filter_btn.toggled.connect(self._apply_filter)
+        toolbar.addWidget(self._filter_btn)
         export_btn = QPushButton("Export Feedback")
         export_btn.setToolTip("Write decisions to _feedback.jsonl in the output folder")
         export_btn.clicked.connect(self._export_feedback)
         toolbar.addWidget(export_btn)
-        self._apply_btn = QPushButton("Apply Approved && Rebuild")
-        self._apply_btn.setToolTip(
-            "Append approved pages to _consolidated.pdf and rebuild "
-            "_consolidated_unmatched.pdf"
-        )
+        if self._mode == "matched":
+            self._apply_btn = QPushButton("Remove Rejected && Rebuild")
+            self._apply_btn.setToolTip(
+                "Rebuild _consolidated.pdf without rejected pages"
+            )
+        else:
+            self._apply_btn = QPushButton("Apply Approved && Rebuild")
+            self._apply_btn.setToolTip(
+                "Append approved pages to _consolidated.pdf and rebuild "
+                "_consolidated_unmatched.pdf"
+            )
         self._apply_btn.clicked.connect(self._apply_approved)
         toolbar.addWidget(self._apply_btn)
         root.addLayout(toolbar)
@@ -586,13 +1286,8 @@ class ReviewDialog(QDialog):
         self._list = QListWidget()
         self._list.setMaximumWidth(220)
         self._list.currentRowChanged.connect(self._on_list_row_changed)
-        for row in self._rows:
-            src = row.get("source_pdf_path", "")
-            stem = src.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].removesuffix(".pdf")
-            pg = row.get("page_num", "?")
-            score = float(row.get("total_hits", 0))
-            item = QListWidgetItem(f"{stem}\np.{pg}  score {score:.2f}")
-            self._list.addItem(item)
+        for i, row in enumerate(self._rows):
+            self._list.addItem(self._make_list_item(i, row))
         splitter.addWidget(self._list)
 
         # Centre: PDF viewer
@@ -623,6 +1318,7 @@ class ReviewDialog(QDialog):
         for field in (
             "Source",
             "Page",
+            "Type",
             "Score",
             "Threshold",
             "Excluded because",
@@ -638,14 +1334,21 @@ class ReviewDialog(QDialog):
         right_layout.addWidget(meta_scroll)
 
         btn_layout = QVBoxLayout()
-        self._approve_btn = QPushButton("Approve  (A)")
-        self._reject_btn = QPushButton("Reject   (R)")
-        self._skip_btn = QPushButton("Skip     (S)")
-        for btn in (self._approve_btn, self._reject_btn, self._skip_btn):
+        self._approve_btn = QPushButton("Approve          (A)")
+        self._reject_dup_btn = QPushButton("Dup / Redundant  (D)")
+        self._reject_irr_btn = QPushButton("Irrelevant       (R)")
+        self._skip_btn = QPushButton("Skip             (S)")
+        for btn in (
+            self._approve_btn,
+            self._reject_dup_btn,
+            self._reject_irr_btn,
+            self._skip_btn,
+        ):
             btn.setFixedHeight(34)
             btn_layout.addWidget(btn)
         self._approve_btn.clicked.connect(self._approve)
-        self._reject_btn.clicked.connect(self._reject)
+        self._reject_dup_btn.clicked.connect(self._reject_duplicate)
+        self._reject_irr_btn.clicked.connect(self._reject_irrelevant)
         self._skip_btn.clicked.connect(self._skip)
         right_layout.addLayout(btn_layout)
         splitter.addWidget(right_panel)
@@ -655,7 +1358,8 @@ class ReviewDialog(QDialog):
 
         # Keyboard shortcuts
         QShortcut(QKeySequence("A"), self).activated.connect(self._approve)
-        QShortcut(QKeySequence("R"), self).activated.connect(self._reject)
+        QShortcut(QKeySequence("D"), self).activated.connect(self._reject_duplicate)
+        QShortcut(QKeySequence("R"), self).activated.connect(self._reject_irrelevant)
         QShortcut(QKeySequence("S"), self).activated.connect(self._skip)
 
     # --------------------------------------------------------- navigation
@@ -699,6 +1403,18 @@ class ReviewDialog(QDialog):
             f"{row.get('page_num', '?')}  "
             f"(consolidated p.{row.get('consolidated_page_num', '?')})"
         )
+        subtype = self._subtypes[index] if index < len(self._subtypes) else None
+        type_display = {
+            "intake":     "Intake / Initial",
+            "discharge":  "Discharge / Termination",
+            "progress":   "Progress Note",
+            "imaging":    "Imaging Report",
+            "legal":      "Legal / Affidavit",
+            "medical":    "Medical Treatment",
+            "vocational": "Vocational",
+            "billing":    "Billing Record",
+        }.get(subtype or "", "—")
+        self._meta_labels["Type"].setText(type_display)
         self._meta_labels["Score"].setText(f"{score:.2f}")
         self._meta_labels["Threshold"].setText(f"{threshold:.2f}")
         self._meta_labels["Excluded because"].setText(
@@ -716,57 +1432,390 @@ class ReviewDialog(QDialog):
             row.get("dates_on_page", "—").replace("|", ", ") or "—"
         )
 
+    # --------------------------------------------------- triage helpers
+
+    def _make_list_item_text(self, idx: int, row: dict) -> str:
+        src = row.get("source_pdf_path", "")
+        stem = src.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].removesuffix(".pdf")
+        pg = row.get("page_num", "?")
+        score = float(row.get("total_hits", 0))
+        subtype = self._subtypes[idx] if idx < len(self._subtypes) else None
+        # [DUP] prefix whenever the page is marked as a duplicate (any source)
+        if self._decisions.get(idx) == "rejected_duplicate":
+            prefix = "[DUP]      "
+        else:
+            prefix = {
+                "intake":     "[INTAKE]   ",
+                "discharge":  "[DISCHARGE]",
+                "progress":   "[PROG]     ",
+                "imaging":    "[IMAGING]  ",
+                "legal":      "[LEGAL]    ",
+                "medical":    "[MEDICAL]  ",
+                "vocational": "[VOC]      ",
+                "billing":    "[BILLING]  ",
+            }.get(subtype or "", "           ")
+        return f"{prefix} {stem}\n           p.{pg}  score {score:.2f}"
+
+    def _make_list_item(self, idx: int, row: dict) -> QListWidgetItem:
+        return QListWidgetItem(self._make_list_item_text(idx, row))
+
+    def _classify_subtype(self, row: dict) -> str | None:
+        cats = {c for c in row.get("categories_matched", "").split("|") if c}
+        if not cats:
+            return None
+        # Therapy subtype takes priority — most granular classification
+        if cats & _THERAPY_CATS:
+            kw = {k.lower() for k in row.get("keywords_hit", "").split("|") if k}
+            if kw & _INTAKE_KW:
+                return "intake"
+            if kw & _DISCHARGE_KW:
+                return "discharge"
+            return "progress"
+        # Non-therapy clinical categories
+        if "IMAGING" in cats:
+            return "imaging"
+        if "INJURY_LEGAL" in cats:
+            return "legal"
+        if "MEDICAL_TREATMENT" in cats:
+            return "medical"
+        if "VOCATIONAL" in cats:
+            return "vocational"
+        if "BILLING" in cats:
+            return "billing"
+        return None
+
+    def _run_smart_triage(self) -> None:
+        """Clinical auto-categorization pass (no duplicate detection — use Find Duplicates).
+
+        Approves therapy intake/discharge pages, applies first/last progress note
+        fallback, pre-rejects remaining progress notes, and auto-approves non-therapy
+        clinical pages. All suggestions are tagged source='smart_triage' so they
+        appear in the distinct pale-blue / pale-lavender / pale-yellow color tier.
+        """
+        from collections import defaultdict
+
+        src_items: dict[str, list[tuple[int, str | None]]] = defaultdict(list)
+        for idx, row in enumerate(self._rows):
+            src_items[row.get("source_pdf_path", "")].append((idx, self._subtypes[idx]))
+
+        # Step 1: therapy — approve intake / discharge per source
+        sources_with_intake_discharge: set[str] = set()
+        intake_discharge_count = 0
+        for src, items in src_items.items():
+            if any(sub in ("intake", "discharge") for _, sub in items):
+                sources_with_intake_discharge.add(src)
+                for idx, sub in items:
+                    if sub in ("intake", "discharge") and idx not in self._decisions:
+                        self._decisions[idx] = "approved"
+                        self._decision_sources[idx] = "smart_triage"
+                        intake_discharge_count += 1
+
+        # Step 2: therapy — first / last progress note fallback
+        fallback_indices: set[int] = set()
+        fallback_count = 0
+        for src, items in src_items.items():
+            if src in sources_with_intake_discharge:
+                continue
+            progress = [
+                (idx, self._rows[idx])
+                for idx, sub in items
+                if sub == "progress"
+            ]
+            if not progress:
+                continue
+
+            def _min_date(r: dict) -> str:
+                ds = [d for d in r.get("dates_on_page", "").split("|") if d]
+                return min(ds) if ds else "9999-99-99"
+
+            def _max_date(r: dict) -> str:
+                ds = [d for d in r.get("dates_on_page", "").split("|") if d]
+                return max(ds) if ds else "0000-00-00"
+
+            first_idx = min(progress, key=lambda t: _min_date(t[1]))[0]
+            last_idx  = max(progress, key=lambda t: _max_date(t[1]))[0]
+            for idx in {first_idx, last_idx}:
+                if idx not in self._decisions:
+                    self._decisions[idx] = "approved"
+                    self._decision_sources[idx] = "smart_triage"
+                    fallback_indices.add(idx)
+                    fallback_count += 1
+
+        # Step 3: therapy — pre-reject remaining progress notes from handled sources
+        handled_sources = sources_with_intake_discharge | {
+            self._rows[i].get("source_pdf_path", "") for i in fallback_indices
+        }
+        irr_count = 0
+        for src, items in src_items.items():
+            if src not in handled_sources:
+                continue
+            for idx, sub in items:
+                if sub == "progress" and idx not in self._decisions:
+                    self._decisions[idx] = "rejected_irrelevant"
+                    self._decision_sources[idx] = "smart_triage"
+                    irr_count += 1
+
+        # Step 4: auto-approve non-therapy clinical pages
+        auto_approve_count = 0
+        for idx, row in enumerate(self._rows):
+            if idx in self._decisions:
+                continue
+            cats = {c for c in row.get("categories_matched", "").split("|") if c}
+            if cats & _AUTO_APPROVE_CATS and not (cats & _THERAPY_CATS):
+                self._decisions[idx] = "approved"
+                self._decision_sources[idx] = "smart_triage"
+                auto_approve_count += 1
+
+        self._refresh_list_colors()
+        self._advance_to_next_unreviewed()
+        self._triage_decisions = dict(self._decisions)
+        self._save_draft()
+
+        QMessageBox.information(
+            self,
+            "Smart Triage Complete",
+            f"Therapy — intake / discharge approved:        {intake_discharge_count}\n"
+            f"Therapy — first / last progress approved:     {fallback_count}\n"
+            f"Therapy — remaining progress pre-rejected:    {irr_count}\n"
+            f"Other clinical pages auto-approved:           {auto_approve_count}\n\n"
+            "Pale blue = Smart Triage suggested approve.\n"
+            "Pale lavender = Smart Triage suggested irrelevant.\n"
+            "Run 'Find Duplicates' for visual duplicate detection.\n\n"
+            "Review pre-selections and adjust as needed before exporting.",
+        )
+
+    def _run_dedup_pass(self) -> None:
+        """Render all pages, compute perceptual hashes, cluster by visual similarity,
+        then open _DedupDialog for each group so the user can confirm which to keep.
+
+        Runs against ALL pages regardless of current decision state so every
+        potential duplicate pair is surfaced for the feedback record.
+        """
+        try:
+            from PySide6.QtPdf import QPdfDocument
+            if not isinstance(self._pdf_doc, QPdfDocument):
+                raise RuntimeError("not loaded")
+        except Exception:
+            QMessageBox.warning(
+                self, "PDF Not Available",
+                "The PDF viewer must be active to run Find Duplicates."
+            )
+            return
+
+        if len(self._rows) < 2:
+            QMessageBox.information(self, "Not Enough Pages",
+                                    "Need at least 2 pages for duplicate detection.")
+            return
+
+        prev_label = self._progress_label.text()
+        self._progress_label.setText("Find Duplicates: rendering pages…")
+        QApplication.processEvents()
+
+        hashes: list[tuple[int, int]] = []
+        thumbnails: dict[int, QImage] = {}
+        for idx, row in enumerate(self._rows):
+            try:
+                page_0idx = max(0, int(row.get("consolidated_page_num", "1")) - 1)
+                qimg = self._pdf_doc.render(page_0idx, QSize(200, 260))
+                if not qimg.isNull():
+                    thumbnails[idx] = qimg
+                    hashes.append((idx, _dhash(qimg)))
+            except Exception:
+                pass
+
+        self._progress_label.setText(prev_label)
+
+        if len(hashes) < 2:
+            QMessageBox.information(self, "No Results",
+                                    "Could not render enough pages for comparison.")
+            return
+
+        raw_clusters = _cluster_by_hash(hashes, threshold=10)
+        groups = [c for c in raw_clusters if len(c) > 1]
+
+        if not groups:
+            QMessageBox.information(
+                self, "No Duplicates Found",
+                "No visually similar pages were detected across the full page set."
+            )
+            return
+
+        # Record cluster membership before opening the dialog
+        self._dedup_groups = {}
+        self._dedup_canonical = set()
+        for g_id, group in enumerate(groups):
+            canonical = max(group, key=lambda i: float(self._rows[i].get("total_hits", 0)))
+            self._dedup_canonical.add(canonical)
+            for idx in group:
+                self._dedup_groups[idx] = g_id
+
+        dialog_groups = [
+            [(idx, self._rows[idx], thumbnails[idx]) for idx in grp if idx in thumbnails]
+            for grp in groups
+        ]
+        dialog_groups = [g for g in dialog_groups if len(g) >= 2]
+
+        dlg = _DedupDialog(
+            dialog_groups,
+            decisions=self._decisions,
+            decision_sources=self._decision_sources,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            self._save_draft()  # persist dedup group membership even on cancel
+            return
+
+        keep_indices, reject_indices = dlg.results()
+        changed = 0
+
+        for idx in reject_indices:
+            self._decisions[idx] = "rejected_duplicate"
+            self._decision_sources[idx] = "find_duplicates"
+            item = self._list.item(idx)
+            if item:
+                item.setText(self._make_list_item_text(idx, self._rows[idx]))
+                color = self._item_color(idx)
+                if color:
+                    item.setBackground(color)
+                item.setForeground(QColor(30, 30, 30))
+            changed += 1
+
+        for idx in keep_indices:
+            if self._decisions.get(idx) not in ("approved",):
+                self._decisions[idx] = "approved"
+                self._decision_sources[idx] = "find_duplicates"
+                item = self._list.item(idx)
+                if item:
+                    item.setText(self._make_list_item_text(idx, self._rows[idx]))
+                    color = self._item_color(idx)
+                    if color:
+                        item.setBackground(color)
+                    item.setForeground(QColor(30, 30, 30))
+                changed += 1
+
+        self._apply_filter()
+        self._update_toolbar()
+        self._save_draft()
+
+        QMessageBox.information(
+            self,
+            "Find Duplicates Complete",
+            f"Detected {len(groups)} group(s) of visually similar pages.\n"
+            f"Applied decisions to {changed} page(s).\n\n"
+            "Pale peach = Find Duplicates flagged duplicate.\n"
+            "Use A / D / R to override any pre-selection as usual.",
+        )
+
+    def _item_color(self, idx: int) -> "QColor | None":
+        """Return the background QColor for a list item based on decision + source."""
+        dec = self._decisions.get(idx)
+        if dec is None:
+            return None
+        src = self._decision_sources.get(idx, "user")
+        rgb = _DECISION_COLORS.get((dec, src)) or _DECISION_COLORS.get((dec, "user"))
+        return QColor(*rgb) if rgb else None
+
     # --------------------------------------------------------- decisions
+
+    def _apply_filter(self) -> None:
+        """Show only approved + duplicate rows when the filter toggle is active."""
+        active = self._filter_btn.isChecked()
+        for idx in range(self._list.count()):
+            item = self._list.item(idx)
+            if item is None:
+                continue
+            if active:
+                dec = self._decisions.get(idx)
+                item.setHidden(dec not in ("approved", "rejected_duplicate"))
+            else:
+                item.setHidden(False)
+
+    def _advance_one(self) -> None:
+        """Move to the next row (+1), skipping hidden items when filter is active."""
+        active_filter = self._filter_btn.isChecked()
+        start = self._current_index + 1
+        for i in range(start, len(self._rows)):
+            if active_filter:
+                item = self._list.item(i)
+                if item and item.isHidden():
+                    continue
+            self._select_row(i)
+            return
 
     def _record_decision(self, decision: str) -> None:
         if self._current_index < 0:
             return
+        was_decided = self._current_index in self._decisions
         self._decisions[self._current_index] = decision
+        self._decision_sources[self._current_index] = "user"
         item = self._list.item(self._current_index)
         if item:
-            if decision == "approved":
-                item.setBackground(QColor(200, 255, 200))
-            elif decision == "rejected":
-                item.setBackground(QColor(255, 200, 200))
+            item.setText(self._make_list_item_text(self._current_index, self._rows[self._current_index]))
+            color = self._item_color(self._current_index)
+            if color:
+                item.setBackground(color)
+            item.setForeground(QColor(30, 30, 30))
+        self._apply_filter()
         self._update_toolbar()
-        self._advance_to_next_unreviewed()
+        self._save_draft()
+        if was_decided:
+            # Reassigning a pre-decided page — advance by one rather than jumping
+            # to the (potentially distant) next unreviewed page
+            self._advance_one()
+        else:
+            self._advance_to_next_unreviewed()
 
     def _approve(self) -> None:
         self._record_decision("approved")
 
-    def _reject(self) -> None:
-        self._record_decision("rejected")
+    def _reject_duplicate(self) -> None:
+        self._record_decision("rejected_duplicate")
+
+    def _reject_irrelevant(self) -> None:
+        self._record_decision("rejected_irrelevant")
 
     def _skip(self) -> None:
         self._advance_to_next_unreviewed()
 
     def _advance_to_next_unreviewed(self) -> None:
+        active_filter = self._filter_btn.isChecked()
         start = self._current_index + 1
         for i in range(start, len(self._rows)):
+            if active_filter:
+                item = self._list.item(i)
+                if item and item.isHidden():
+                    continue
             if i not in self._decisions:
                 self._select_row(i)
                 return
-        # Wrap around from the beginning
         for i in range(0, start):
+            if active_filter:
+                item = self._list.item(i)
+                if item and item.isHidden():
+                    continue
             if i not in self._decisions:
                 self._select_row(i)
                 return
 
     def _refresh_list_colors(self) -> None:
-        for idx, decision in self._decisions.items():
+        for idx in range(self._list.count()):
             item = self._list.item(idx)
-            if item:
-                if decision == "approved":
-                    item.setBackground(QColor(200, 255, 200))
-                elif decision == "rejected":
-                    item.setBackground(QColor(255, 200, 200))
+            if item is None:
+                continue
+            item.setText(self._make_list_item_text(idx, self._rows[idx]))
+            color = self._item_color(idx)
+            if color:
+                item.setBackground(color)
+                item.setForeground(QColor(30, 30, 30))
+        self._apply_filter()
 
     def _update_toolbar(self) -> None:
         approved = sum(1 for d in self._decisions.values() if d == "approved")
-        rejected = sum(1 for d in self._decisions.values() if d == "rejected")
+        dup = sum(1 for d in self._decisions.values() if d == "rejected_duplicate")
+        irr = sum(1 for d in self._decisions.values() if d == "rejected_irrelevant")
         remaining = len(self._rows) - len(self._decisions)
         self._progress_label.setText(
-            f"{approved} approved / {rejected} rejected / {remaining} remaining"
+            f"{approved} approved / {dup} duplicate / {irr} irrelevant / {remaining} remaining"
         )
 
     # --------------------------------------------------------- export / apply
@@ -799,13 +1848,58 @@ class ReviewDialog(QDialog):
             threshold = float(row.get("min_hits_threshold", 0))
             cats = row.get("categories_matched", "")
             keywords = row.get("keywords_hit", "")
-            # Build per-category score map
             cat_names = [c for c in cats.split("|") if c]
             kw_list = [k for k in keywords.split("|") if k]
+            if decision == "approved":
+                label_str = "include"
+                rejection_reason = None
+            elif decision == "rejected_duplicate":
+                label_str = "exclude"
+                rejection_reason = "duplicate"
+            else:
+                label_str = "exclude"
+                rejection_reason = "irrelevant"
+
+            triage_dec = self._triage_decisions.get(idx)
+            if triage_dec == "approved":
+                triage_label_str: "str | None" = "include"
+                triage_rejection_reason: "str | None" = None
+            elif triage_dec == "rejected_duplicate":
+                triage_label_str = "exclude"
+                triage_rejection_reason = "duplicate"
+            elif triage_dec == "rejected_irrelevant":
+                triage_label_str = "exclude"
+                triage_rejection_reason = "irrelevant"
+            else:
+                triage_label_str = None
+                triage_rejection_reason = None
+
+            # Find Duplicates provenance
+            dedup_group_id = self._dedup_groups.get(idx)
+            dedup_is_canonical: "bool | None" = (
+                (idx in self._dedup_canonical) if dedup_group_id is not None else None
+            )
+            if dedup_group_id is None:
+                dedup_suggestion = None
+            elif idx in self._dedup_canonical:
+                dedup_suggestion = "approve"
+            else:
+                dedup_suggestion = "reject_duplicate"
+
             rec = {
                 "schema_version": 1,
-                "label": "include" if decision == "approved" else "exclude",
+                "label": label_str,
+                "rejection_reason": rejection_reason,
+                "scanner_decision": self._mode,        # "matched" | "unmatched"
+                "decision_source": self._decision_sources.get(idx, "user"),
+                "triage_label": triage_label_str,
+                "triage_rejection_reason": triage_rejection_reason,
+                "triage_override": triage_label_str is not None and triage_label_str != label_str,
+                "find_duplicates_group_id": dedup_group_id,
+                "find_duplicates_is_canonical": dedup_is_canonical,
+                "find_duplicates_suggestion": dedup_suggestion,
                 "review_timestamp": now,
+                "scan_settings": self._scan_settings,
                 "source_pdf_path": src,
                 "page_num": pg,
                 "total_hits": score,
@@ -831,6 +1925,14 @@ class ReviewDialog(QDialog):
             for rec in existing.values():
                 f.write(json.dumps(rec) + "\n")
 
+        # Draft is superseded by the committed feedback file — clear it
+        try:
+            if self._draft_path.exists():
+                self._draft_path.unlink()
+        except OSError:
+            pass
+
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._output_dir)))
         QMessageBox.information(
             self,
             "Feedback Exported",
@@ -838,50 +1940,77 @@ class ReviewDialog(QDialog):
         )
 
     def _apply_approved(self) -> None:
-        approved_count = sum(
-            1 for d in self._decisions.values() if d == "approved"
-        )
-        if approved_count == 0:
-            QMessageBox.information(
-                self, "Nothing to Apply", "No pages have been approved yet."
+        if self._mode == "matched":
+            remove_count = sum(
+                1 for d in self._decisions.values()
+                if d in ("rejected_duplicate", "rejected_irrelevant")
             )
-            return
-
-        reply = QMessageBox.question(
-            self,
-            "Apply Approved Pages",
-            f"Append {approved_count} approved page(s) to _consolidated.pdf "
-            f"and rebuild _consolidated_unmatched.pdf?\n\n"
-            f"This will modify the output files. Make sure you have exported "
-            f"your feedback first.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
+            if remove_count == 0:
+                QMessageBox.information(
+                    self, "Nothing to Remove",
+                    "No pages have been marked for removal yet."
+                )
+                return
+            reply = QMessageBox.question(
+                self,
+                "Remove Pages from Consolidated",
+                f"Remove {remove_count} rejected page(s) from _consolidated.pdf?\n\n"
+                "This will modify the output file. Make sure you have exported "
+                "your feedback first.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+        else:
+            approved_count = sum(
+                1 for d in self._decisions.values() if d == "approved"
+            )
+            if approved_count == 0:
+                QMessageBox.information(
+                    self, "Nothing to Apply", "No pages have been approved yet."
+                )
+                return
+            reply = QMessageBox.question(
+                self,
+                "Apply Approved Pages",
+                f"Append {approved_count} approved page(s) to _consolidated.pdf "
+                f"and rebuild _consolidated_unmatched.pdf?\n\n"
+                f"This will modify the output files. Make sure you have exported "
+                f"your feedback first.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        # Export feedback first so apply_feedback() has fresh data
+        # Export feedback first so the backend has fresh data
         self._export_feedback()
 
         self._apply_btn.setEnabled(False)
         self._fb_worker = _FeedbackWorker(
-            str(self._output_dir), str(self._feedback_path)
+            str(self._output_dir), str(self._feedback_path), mode=self._mode
         )
         self._fb_worker.progress.connect(self._progress_label.setText)
         self._fb_worker.finished.connect(self._on_apply_finished)
         self._fb_worker.error.connect(self._on_apply_error)
         self._fb_worker.start()
 
-    def _on_apply_finished(self, approved: int, _rejected: int, skipped: int) -> None:
+    def _on_apply_finished(self, primary: int, _secondary: int, skipped: int) -> None:
+        self._apply_result = (primary, skipped)
         self._apply_btn.setEnabled(True)
-        msg = f"Applied {approved} approved page(s)."
-        if skipped:
-            msg += (
+        if self._mode == "matched":
+            msg = f"Consolidated PDF rebuilt — {primary} page(s) kept."
+            skip_note = f"\n{skipped} page(s) skipped — source file(s) not found."
+        else:
+            msg = f"Applied {primary} approved page(s)."
+            skip_note = (
                 f"\n{skipped} page(s) could not be applied — "
                 f"source file(s) not found at stored path."
             )
+        if skipped:
+            msg += skip_note
         QMessageBox.information(self, "Apply Complete", msg)
         self._update_toolbar()
+        self.accept()
 
     def _on_apply_error(self, message: str) -> None:
         self._apply_btn.setEnabled(True)
