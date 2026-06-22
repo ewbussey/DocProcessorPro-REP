@@ -1,0 +1,6 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/icons">
+    <file alias="app_icon.svg">dpp_scripts/gui_files/icons/delivery_truck_speed_icon.svg</file>
+  </qresource>
+</RCC>

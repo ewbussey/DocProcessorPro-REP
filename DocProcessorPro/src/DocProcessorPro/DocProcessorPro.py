@@ -11,8 +11,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import DocProcessorPro.resources_rc  # noqa: F401  — registers embedded Qt resources
 from PySide6.QtCore import QPointF, QSettings, QSize, QThread, QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QImage, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImage, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -2101,7 +2102,8 @@ def main() -> None:
     setup_logging()
     save_install_location()
 
-    app = QApplication.instance() or QApplication(sys.argv)
+    app: QApplication = QApplication.instance() or QApplication(sys.argv)  # type: ignore[assignment]
+    app.setWindowIcon(QIcon(":/icons/app_icon.svg"))
     dialog = ScannerDialog()
     dialog.show()
     sys.exit(app.exec())
