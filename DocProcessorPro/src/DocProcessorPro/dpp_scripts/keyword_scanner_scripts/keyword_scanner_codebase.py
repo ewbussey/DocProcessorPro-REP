@@ -297,10 +297,26 @@ class PageMatch:
 
 
 @dataclass
+class PageExclusion:
+    """A page that scored > 0 but failed one or more inclusion gates."""
+
+    page_num: int  # 0-indexed (matches PageMatch convention)
+    categories: list[str]  # categories that did match (may be empty)
+    keywords_hit: list[str]  # deduplicated matched keywords
+    extraction_method: str  # "pdfplumber" or "ocr"
+    total_hits: float  # weighted score (> 0.0)
+    dates_on_page: list[str]  # ISO dates found on this page
+    exclusion_reasons: list[str]  # subset of: "below_threshold", "no_anchor",
+    #   "no_required_category", "blocked_pattern"
+    min_hits_threshold: float  # threshold in effect at scan time
+
+
+@dataclass
 class ScanResult:
     """Return value of scan_pdf(), bundling page matches with per-document date info."""
 
     matches: list[PageMatch]
+    exclusions: list[PageExclusion]  # scored-but-excluded pages (score > 0)
     source_date_first: str | None  # ISO YYYY-MM-DD, earliest date across all pages
     source_date_last: str | None  # ISO YYYY-MM-DD, latest date across all pages
     source_date_count: int  # number of unique dates found across all pages
@@ -927,6 +943,7 @@ def scan_pdf(
 
     # Pass 3: keyword matching + date extraction (all pages)
     matches: list[PageMatch] = []
+    exclusions: list[PageExclusion] = []
     all_page_dates: dict[int, list[str]] = {}
     all_dates: set[datetime.date] = set()
 
@@ -935,19 +952,42 @@ def scan_pdf(
         all_dates.update(page_dates)
         all_page_dates[i] = [d.isoformat() for d in page_dates]
 
-        if any(pat.search(text) for pat in _IRRELEVANT_PAGE_PATTERNS):
-            log.debug("Page %d skipped — matched irrelevant-page blocklist.", i + 1)
-            continue
-
-        all_keywords: list[str] = []
+        # Count keywords first (before blocklist) so blocked-but-scored pages
+        # can be captured as reviewable exclusions.
         matched_categories: list[str] = []
         weighted_score: float = 0.0
         for cat in categories:
             hits = cat.hits(text)
             if hits:
                 matched_categories.append(cat.name)
-                all_keywords.extend(hits)
                 weighted_score += cat.weight * len(hits)
+
+        # Deduplicated keyword list (preserves insertion order across categories)
+        all_keywords: list[str] = list(
+            dict.fromkeys(kw for cat in categories for kw in cat.hits(text))
+        )
+
+        # Blocklist check — skip page, but record as exclusion if it scored > 0
+        if any(pat.search(text) for pat in _IRRELEVANT_PAGE_PATTERNS):
+            log.debug("Page %d skipped — matched irrelevant-page blocklist.", i + 1)
+            if weighted_score > 0:
+                exclusions.append(
+                    PageExclusion(
+                        page_num=i,
+                        categories=matched_categories,
+                        keywords_hit=all_keywords,
+                        extraction_method=method,
+                        total_hits=round(weighted_score, 2),
+                        dates_on_page=all_page_dates[i],
+                        exclusion_reasons=["blocked_pattern"],
+                        min_hits_threshold=min_hits,
+                    )
+                )
+            continue
+
+        if weighted_score == 0.0:
+            continue  # definitively non-clinical — not worth reviewing
+
         passes_min_hits = weighted_score >= min_hits
         passes_required = require_categories is None or bool(
             set(matched_categories) & require_categories
@@ -967,18 +1007,39 @@ def scan_pdf(
                 )
             )
             log.debug("Page %d matched: %s", i + 1, matched_categories)
+        else:
+            reasons: list[str] = []
+            if not passes_min_hits:
+                reasons.append("below_threshold")
+            if not passes_anchor:
+                reasons.append("no_anchor")
+            if not passes_required:
+                reasons.append("no_required_category")
+            exclusions.append(
+                PageExclusion(
+                    page_num=i,
+                    categories=matched_categories,
+                    keywords_hit=all_keywords,
+                    extraction_method=method,
+                    total_hits=round(weighted_score, 2),
+                    dates_on_page=all_page_dates[i],
+                    exclusion_reasons=reasons,
+                    min_hits_threshold=min_hits,
+                )
+            )
 
     unique_dates = sorted(all_dates)
     log.info(
-        "%s: %d / %d pages matched (min_score=%.2f). %d unique date(s) found.",
+        "%s: %d matched, %d reviewable exclusion(s) (min_score=%.2f). %d unique date(s).",
         path.name,
         len(matches),
-        page_count,
+        len(exclusions),
         min_hits,
         len(unique_dates),
     )
     return ScanResult(
         matches=matches,
+        exclusions=exclusions,
         source_date_first=unique_dates[0].isoformat() if unique_dates else None,
         source_date_last=unique_dates[-1].isoformat() if unique_dates else None,
         source_date_count=len(unique_dates),
@@ -1135,6 +1196,89 @@ def write_dates_csv(
                 ]
             )
     log.info("Dates CSV written to %s.", out.name)
+
+
+def extract_unmatched_pages(
+    pdf_path: str,
+    exclusions: list[PageExclusion],
+    output_path: str,
+) -> None:
+    """
+    Write all scored-but-excluded pages to a new PDF.
+
+    No page buffer is applied — each excluded page stands alone for reviewer judgment.
+
+    Args:
+        pdf_path:    Source PDF path.
+        exclusions:  PageExclusion list from scan_pdf().
+        output_path: Destination .pdf path.
+    """
+    if not exclusions:
+        return
+
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    reader = pypdf.PdfReader(pdf_path)
+    writer = pypdf.PdfWriter()
+    for exc in sorted(exclusions, key=lambda x: x.page_num):
+        writer.add_page(reader.pages[exc.page_num])
+
+    with open(out, "wb") as f:
+        writer.write(f)
+
+    log.info("Wrote %d unmatched page(s) to %s.", len(exclusions), out.name)
+
+
+def write_unmatched_manifest(
+    pdf_path_absolute: str,
+    exclusions: list[PageExclusion],
+    output_csv_path: str,
+) -> None:
+    """
+    Write a CSV manifest with one row per scored-but-excluded page.
+
+    Stores the absolute source PDF path (required by apply_feedback() to re-open
+    source files). Multi-value fields are pipe-separated.
+
+    Columns: source_pdf_path (absolute), page_num (1-indexed), categories_matched,
+    keywords_hit, extraction_method, total_hits, min_hits_threshold,
+    exclusion_reasons, dates_on_page.
+    """
+    out = Path(output_csv_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "source_pdf_path",
+                "page_num",
+                "categories_matched",
+                "keywords_hit",
+                "extraction_method",
+                "total_hits",
+                "min_hits_threshold",
+                "exclusion_reasons",
+                "dates_on_page",
+            ]
+        )
+        for exc in sorted(exclusions, key=lambda x: x.page_num):
+            writer.writerow(
+                [
+                    pdf_path_absolute,
+                    exc.page_num + 1,
+                    "|".join(exc.categories),
+                    "|".join(exc.keywords_hit),
+                    exc.extraction_method,
+                    exc.total_hits,
+                    exc.min_hits_threshold,
+                    "|".join(exc.exclusion_reasons),
+                    "|".join(exc.dates_on_page),
+                ]
+            )
+
+    log.info("Unmatched manifest written to %s.", out.name)
 
 
 # CONSOLIDATION HELPERS
@@ -1392,6 +1536,106 @@ def consolidate_dates(
     return dest
 
 
+def consolidate_unmatched(
+    output_dir: str,
+    pdf_stems: list[str],
+    progress_callback: Callable[[str], None] | None = None,
+) -> tuple[Path | None, Path | None]:
+    """
+    Combine every {stem}_unmatched.pdf into _consolidated_unmatched.pdf, inserting
+    a labeled separator page before each source document's pages.
+
+    Also merges every {stem}_unmatched_manifest.csv into
+    _consolidated_unmatched_manifest.csv, adding a consolidated_page_num column
+    (1-indexed position within the consolidated PDF) so the ReviewDialog can
+    navigate QPdfView directly without parsing filenames.
+
+    Individual per-stem files are deleted after consolidation.
+
+    Returns: (Path to consolidated PDF or None, Path to consolidated manifest or None)
+    """
+    out = Path(output_dir)
+    writer = pypdf.PdfWriter()
+    all_manifest_rows: list[dict] = []
+    included = 0
+    current_page = 0  # 0-indexed running counter (separator + content pages)
+
+    for stem in pdf_stems:
+        unmatched_pdf = out / f"{stem}_unmatched.pdf"
+        unmatched_csv = out / f"{stem}_unmatched_manifest.csv"
+        if not unmatched_pdf.exists():
+            continue
+        if progress_callback:
+            progress_callback(f"Consolidating unmatched: {stem}…")
+
+        # Separator page — bookmark points here
+        sep_buf = _make_separator_page(f"{stem}.pdf")
+        sep_reader = pypdf.PdfReader(sep_buf)
+        writer.add_page(sep_reader.pages[0])
+        writer.add_outline_item(f"{stem}.pdf", current_page)
+        current_page += 1  # separator occupies one page
+
+        # Unmatched content pages
+        reader = pypdf.PdfReader(str(unmatched_pdf))
+        page_count_for_stem = len(reader.pages)
+        first_content_page = current_page  # 0-indexed position of first content page
+        for page in reader.pages:
+            writer.add_page(page)
+            current_page += 1
+
+        # Read the per-stem manifest and annotate with consolidated_page_num.
+        # The nth row in the CSV corresponds to the nth content page for this stem
+        # (both are ordered by page_num ascending from write_unmatched_manifest).
+        if unmatched_csv.exists():
+            with open(unmatched_csv, newline="", encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+            for idx, row in enumerate(rows):
+                if idx < page_count_for_stem:
+                    # consolidated_page_num is 1-indexed
+                    row["consolidated_page_num"] = first_content_page + idx + 1
+                    all_manifest_rows.append(row)
+
+        included += 1
+
+    if not included:
+        return None, None
+
+    # Write consolidated PDF
+    pdf_dest = out / "_consolidated_unmatched.pdf"
+    with open(pdf_dest, "wb") as f:
+        writer.write(f)
+    log.info(
+        "Consolidated unmatched PDF written to %s (%d source(s)).",
+        pdf_dest.name,
+        included,
+    )
+
+    # Write consolidated manifest
+    csv_dest: Path | None = None
+    if all_manifest_rows:
+        csv_dest = out / "_consolidated_unmatched_manifest.csv"
+        fieldnames = list(all_manifest_rows[0].keys())
+        with open(csv_dest, "w", newline="", encoding="utf-8") as f:
+            csv_writer = csv.DictWriter(f, fieldnames=fieldnames)
+            csv_writer.writeheader()
+            csv_writer.writerows(all_manifest_rows)
+        log.info(
+            "Consolidated unmatched manifest written to %s (%d row(s)).",
+            csv_dest.name,
+            len(all_manifest_rows),
+        )
+
+    # Remove individual files
+    for stem in pdf_stems:
+        for suffix in ("_unmatched.pdf", "_unmatched_manifest.csv"):
+            f = out / f"{stem}{suffix}"
+            if f.exists():
+                f.unlink()
+                log.debug("Removed individual unmatched file: %s", f.name)
+
+    return pdf_dest, csv_dest
+
+
 # BATCH PROCESSOR
 
 
@@ -1404,7 +1648,7 @@ def scan_directory(
     require_categories: frozenset[str] | None = None,
     require_anchor: bool = False,
     progress_callback: Callable[[str], None] | None = None,
-) -> dict[str, list[PageMatch]]:
+) -> dict[str, ScanResult]:
     """
     Batch-process all .pdf files in input_dir.
 
@@ -1412,13 +1656,18 @@ def scan_directory(
     - Writes {stem}_matched.pdf to output_dir
     - Writes {stem}_manifest.csv to output_dir
 
-    PDFs with zero matches produce no output files.
+    For each PDF with at least one scored-but-excluded page:
+    - Writes {stem}_unmatched.pdf to output_dir
+    - Writes {stem}_unmatched_manifest.csv to output_dir
+
+    After all PDFs are processed, consolidates matched and unmatched outputs
+    into _consolidated.pdf / _consolidated_unmatched.pdf respectively.
 
     Args:
         progress_callback: Optional callable receiving a status string before
                         each file and on each OCR page (used by the GUI worker).
 
-    Returns: {pdf_stem: list[PageMatch]} for all processed files.
+    Returns: {pdf_stem: ScanResult} for all processed files.
     """
     in_dir = Path(input_dir)
     out_dir = Path(output_dir)
@@ -1438,9 +1687,17 @@ def scan_directory(
         rel_parts = pdf_path.relative_to(in_dir).with_suffix("").parts
         items.append((pdf_path, "_".join(rel_parts)))
 
-    results: dict[str, list[PageMatch]] = {}
+    results: dict[str, ScanResult] = {}
 
-    def _scan_one(pdf_path: Path, safe_stem: str) -> tuple[str, list[PageMatch]]:
+    def _scan_one(pdf_path: Path, safe_stem: str) -> tuple[str, ScanResult]:
+        empty = ScanResult(
+            matches=[],
+            exclusions=[],
+            source_date_first=None,
+            source_date_last=None,
+            source_date_count=0,
+            all_page_dates={},
+        )
         if progress_callback:
             progress_callback(f"Scanning {pdf_path.name}…")
         try:
@@ -1454,32 +1711,43 @@ def scan_directory(
             )
         except Exception:
             log.exception("Failed to scan %s — skipping.", pdf_path.name)
-            return safe_stem, []
+            return safe_stem, empty
 
-        matches = result.matches
-        if not matches:
+        if result.matches:
+            extract_matched_pages(
+                str(pdf_path),
+                result.matches,
+                str(out_dir / f"{safe_stem}_matched.pdf"),
+                page_buffer=page_buffer,
+            )
+            write_manifest(
+                safe_stem,
+                result.matches,
+                str(out_dir / f"{safe_stem}_manifest.csv"),
+                source_date_first=result.source_date_first,
+                source_date_last=result.source_date_last,
+                source_date_count=result.source_date_count,
+            )
+            write_dates_csv(
+                result.all_page_dates,
+                str(out_dir / f"{safe_stem}_dates.csv"),
+            )
+        else:
             log.info("%s: no matches.", pdf_path.name)
-            return safe_stem, []
 
-        extract_matched_pages(
-            str(pdf_path),
-            matches,
-            str(out_dir / f"{safe_stem}_matched.pdf"),
-            page_buffer=page_buffer,
-        )
-        write_manifest(
-            safe_stem,
-            matches,
-            str(out_dir / f"{safe_stem}_manifest.csv"),
-            source_date_first=result.source_date_first,
-            source_date_last=result.source_date_last,
-            source_date_count=result.source_date_count,
-        )
-        write_dates_csv(
-            result.all_page_dates,
-            str(out_dir / f"{safe_stem}_dates.csv"),
-        )
-        return safe_stem, matches
+        if result.exclusions:
+            extract_unmatched_pages(
+                str(pdf_path),
+                result.exclusions,
+                str(out_dir / f"{safe_stem}_unmatched.pdf"),
+            )
+            write_unmatched_manifest(
+                str(pdf_path),
+                result.exclusions,
+                str(out_dir / f"{safe_stem}_unmatched_manifest.csv"),
+            )
+
+        return safe_stem, result
 
     max_workers = min(len(pdfs), os.cpu_count() or 4)
     completed = 0
@@ -1489,19 +1757,27 @@ def scan_directory(
             pdf_path, safe_stem = futures[fut]
             completed += 1
             try:
-                stem, matches = fut.result()
-                results[stem] = matches
+                stem, result = fut.result()
+                results[stem] = result
             except Exception:
                 log.exception("Unexpected error processing %s.", pdf_path.name)
-                results[safe_stem] = []
+                results[safe_stem] = ScanResult(
+                    matches=[],
+                    exclusions=[],
+                    source_date_first=None,
+                    source_date_last=None,
+                    source_date_count=0,
+                    all_page_dates={},
+                )
             if progress_callback:
                 progress_callback(
                     f"Finished {pdf_path.name} ({completed}/{len(pdfs)})…"
                 )
 
-    # Consolidate across all source PDFs that had matches, preserving scan order
     safe_stems = [s for _, s in items]
-    matched_stems = [s for s in safe_stems if results.get(s)]
+
+    # Consolidate matched outputs
+    matched_stems = [s for s in safe_stems if results.get(s) and results[s].matches]
     if matched_stems:
         consolidated = consolidate_to_pdf(output_dir, matched_stems, progress_callback)
         consolidate_manifests(output_dir, matched_stems)
@@ -1509,4 +1785,206 @@ def scan_directory(
         if consolidated:
             _ocr_consolidated(consolidated, progress_callback)
 
+    # Consolidate unmatched outputs (independent — a PDF with zero matches can
+    # still have scored-but-excluded pages)
+    unmatched_stems = [
+        s for s in safe_stems if (out_dir / f"{s}_unmatched.pdf").exists()
+    ]
+    if unmatched_stems:
+        consolidate_unmatched(output_dir, unmatched_stems, progress_callback)
+
     return results
+
+
+def apply_feedback(
+    output_dir: str,
+    feedback_path: str,
+    progress_callback: Callable[[str], None] | None = None,
+) -> tuple[int, int, int]:
+    """
+    Apply approved feedback decisions to the consolidated outputs.
+
+    Reads _feedback.jsonl, extracts approved pages from their source PDFs,
+    appends them (with a separator page) to _consolidated.pdf, and rebuilds
+    _consolidated_unmatched.pdf to remove the now-approved pages.
+
+    Approved pages are appended to the end of _consolidated.pdf rather than
+    inserted in source-document order — a full order-preserving rebuild would
+    require absolute paths in the matched manifest (currently stores bare
+    filenames only).
+
+    Args:
+        output_dir:    Directory containing _consolidated.pdf and
+                       _consolidated_unmatched_manifest.csv.
+        feedback_path: Path to _feedback.jsonl.
+
+    Returns: (pages_approved, pages_rejected, pages_skipped_missing_source)
+    """
+    import json
+
+    out = Path(output_dir)
+    fb = Path(feedback_path)
+
+    if not fb.exists():
+        raise FileNotFoundError(f"Feedback file not found: {fb}")
+
+    # Parse feedback records
+    approved: dict[str, list[int]] = {}  # source_pdf_path → list of 0-indexed page_nums
+    rejected_count = 0
+    for line in fb.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            log.warning("Skipping malformed feedback line: %s", line[:80])
+            continue
+        label = rec.get("label", "")
+        if label == "include":
+            src = rec.get("source_pdf_path", "")
+            pg = rec.get("page_num")
+            if src and pg is not None:
+                approved.setdefault(src, []).append(int(pg) - 1)  # 0-indexed
+        elif label == "exclude":
+            rejected_count += 1
+
+    if not approved:
+        log.info("apply_feedback: no approved pages to apply.")
+        return 0, rejected_count, 0
+
+    # Append approved pages to _consolidated.pdf
+    consolidated = out / "_consolidated.pdf"
+    if not consolidated.exists():
+        raise FileNotFoundError(f"Consolidated PDF not found: {consolidated}")
+
+    if progress_callback:
+        progress_callback("Applying approved pages to consolidated PDF…")
+
+    existing_reader = pypdf.PdfReader(str(consolidated))
+    new_writer = pypdf.PdfWriter()
+    for page in existing_reader.pages:
+        new_writer.add_page(page)
+
+    pages_approved = 0
+    skipped_missing = 0
+    for src_path, page_nums in sorted(approved.items()):
+        if not Path(src_path).exists():
+            log.warning(
+                "apply_feedback: source PDF not found at stored path — skipping. (%s)",
+                src_path,
+            )
+            skipped_missing += len(page_nums)
+            continue
+        sep_buf = _make_separator_page(Path(src_path).name + " [approved]")
+        sep_reader = pypdf.PdfReader(sep_buf)
+        new_writer.add_page(sep_reader.pages[0])
+        src_reader = pypdf.PdfReader(src_path)
+        for pn in sorted(page_nums):
+            if 0 <= pn < len(src_reader.pages):
+                new_writer.add_page(src_reader.pages[pn])
+                pages_approved += 1
+
+    tmp = consolidated.with_suffix(".tmp.pdf")
+    with open(tmp, "wb") as f:
+        new_writer.write(f)
+    tmp.replace(consolidated)
+    log.info("apply_feedback: appended %d approved page(s) to %s.", pages_approved, consolidated.name)
+
+    # Rebuild _consolidated_unmatched.pdf by removing approved pages
+    unmatched_manifest = out / "_consolidated_unmatched_manifest.csv"
+    if unmatched_manifest.exists() and pages_approved:
+        if progress_callback:
+            progress_callback("Rebuilding consolidated unmatched PDF…")
+
+        approved_keys: set[tuple[str, int]] = {
+            (src, pn + 1)  # back to 1-indexed to match manifest
+            for src, pns in approved.items()
+            for pn in pns
+        }
+
+        with open(unmatched_manifest, newline="", encoding="utf-8") as f:
+            all_rows = list(csv.DictReader(f))
+
+        remaining_rows = [
+            r for r in all_rows
+            if (r.get("source_pdf_path", ""), int(r.get("page_num", 0)))
+            not in approved_keys
+        ]
+
+        if len(remaining_rows) < len(all_rows):
+            # Re-extract remaining pages from source PDFs grouped by source
+            stems_seen: dict[str, list[dict]] = {}
+            for row in remaining_rows:
+                src = row.get("source_pdf_path", "")
+                stems_seen.setdefault(src, []).append(row)
+
+            tmp_dir = out / "_unmatched_rebuild_tmp"
+            tmp_dir.mkdir(exist_ok=True)
+            rebuilt_stems: list[str] = []
+            try:
+                for src_path, rows in stems_seen.items():
+                    if not Path(src_path).exists():
+                        log.warning(
+                            "apply_feedback: cannot rebuild unmatched for missing source: %s",
+                            src_path,
+                        )
+                        continue
+                    stem = Path(src_path).stem
+                    page_nums_0idx = [int(r["page_num"]) - 1 for r in rows]
+                    src_reader = pypdf.PdfReader(src_path)
+                    rebuild_writer = pypdf.PdfWriter()
+                    for pn in sorted(page_nums_0idx):
+                        if 0 <= pn < len(src_reader.pages):
+                            rebuild_writer.add_page(src_reader.pages[pn])
+                    pdf_out = tmp_dir / f"{stem}_unmatched.pdf"
+                    with open(pdf_out, "wb") as f:
+                        rebuild_writer.write(f)
+                    csv_out = tmp_dir / f"{stem}_unmatched_manifest.csv"
+                    # Re-write per-stem manifest (without consolidated_page_num — will be recomputed)
+                    with open(csv_out, "w", newline="", encoding="utf-8") as f:
+                        base_fields = [
+                            k for k in rows[0].keys()
+                            if k != "consolidated_page_num"
+                        ]
+                        w = csv.DictWriter(f, fieldnames=base_fields)
+                        w.writeheader()
+                        for row in rows:
+                            w.writerow({k: row[k] for k in base_fields})
+                    rebuilt_stems.append(stem)
+
+                if rebuilt_stems:
+                    # Remove old consolidated unmatched files then re-consolidate
+                    for old in (
+                        out / "_consolidated_unmatched.pdf",
+                        out / "_consolidated_unmatched_manifest.csv",
+                    ):
+                        if old.exists():
+                            old.unlink()
+                    # Move tmp files into output_dir for consolidation
+                    for stem in rebuilt_stems:
+                        for suffix in ("_unmatched.pdf", "_unmatched_manifest.csv"):
+                            src_f = tmp_dir / f"{stem}{suffix}"
+                            if src_f.exists():
+                                src_f.rename(out / f"{stem}{suffix}")
+                    consolidate_unmatched(output_dir, rebuilt_stems, progress_callback)
+                else:
+                    # All remaining unmatched pages came from missing sources — clear the files
+                    for old in (
+                        out / "_consolidated_unmatched.pdf",
+                        out / "_consolidated_unmatched_manifest.csv",
+                    ):
+                        if old.exists():
+                            old.unlink()
+            finally:
+                if tmp_dir.exists():
+                    import shutil
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    log.info(
+        "apply_feedback complete: %d approved, %d rejected, %d skipped (missing source).",
+        pages_approved,
+        rejected_count,
+        skipped_missing,
+    )
+    return pages_approved, rejected_count, skipped_missing
