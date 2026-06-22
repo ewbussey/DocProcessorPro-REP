@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -35,6 +36,22 @@ log = logging.getLogger(__name__)
 _MIN_NATIVE_CHARS = 100
 
 # Date extraction helpers
+
+# Dates immediately preceded by one of these labels are dates of birth and
+# should be excluded from the dates manifest.  The lookbehind window is kept
+# short (60 chars) so a label earlier on the same page cannot suppress an
+# unrelated date.
+_DOB_CONTEXT_RE = re.compile(
+    r"\b(?:"
+    r"date\s+of\s+birth"   # "date of birth"
+    r"|birth\s*date"        # "birth date" / "birthdate"
+    r"|dob"                 # DOB
+    r"|d\.o\.b\.?"          # D.O.B. / D.O.B
+    r"|born(?:\s+on)?"      # "born" / "born on"
+    r")\b",
+    re.IGNORECASE,
+)
+_DOB_LOOKBEHIND = 60  # characters before the date match to scan
 
 _DATE_RE = re.compile(
     r"\b(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})\b"
@@ -64,9 +81,17 @@ _MONTH_MAP = {
 
 
 def _extract_dates(text: str) -> list[datetime.date]:
-    """Return sorted unique dates found in text, filtered to 1900-2099."""
+    """Return sorted unique dates found in text, filtered to 1900-2099.
+
+    Dates that immediately follow a date-of-birth label within
+    _DOB_LOOKBEHIND characters are suppressed so patient demographics
+    do not contaminate the clinical-event dates manifest.
+    """
     found: set[datetime.date] = set()
     for m in _DATE_RE.finditer(text):
+        preceding = text[max(0, m.start() - _DOB_LOOKBEHIND) : m.start()]
+        if _DOB_CONTEXT_RE.search(preceding):
+            continue
         g = m.groups()
         try:
             if g[0] is not None:  # MM/DD/YYYY or M-D-YY
@@ -1008,6 +1033,65 @@ _IRRELEVANT_PAGE_PATTERNS: list[re.Pattern] = [
 ]
 
 
+# DEPOSITION DETECTION
+
+# A single match on any of these is a high-confidence deposition signal.
+_DEPO_STRONG_RE = re.compile(
+    r"\bDEPOSITION\s+OF\b"
+    r"|\bDEPONENT\b"
+    r"|\bTRANSCRIPT\s+OF\s+(?:ORAL\s+)?(?:DEPOSITION|PROCEEDINGS)\b",
+    re.IGNORECASE,
+)
+
+# Supporting signals — two or more required when the strong pattern is absent.
+_DEPO_SUPPORTING_RES = [
+    re.compile(r"^\s*Q\s*[.:]\s+\S", re.MULTILINE),          # Q. ... transcript line
+    re.compile(r"\bEXAMINATION\s+BY\b", re.IGNORECASE),
+    re.compile(r"\bCOURT\s+REPORTER\b|\bREPORTER'?S?\s+CERTIFICATE\b", re.IGNORECASE),
+    re.compile(r"\b(?:DULY\s+)?SWORN\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:CROSS|DIRECT|REDIRECT)[- ]EXAMINATION\b", re.IGNORECASE
+    ),
+]
+
+_DEPO_CHECK_PAGES = 10
+
+
+def _is_deposition(pdf_path: str) -> bool:
+    """Return True if the PDF appears to be a deposition transcript.
+
+    Checks the first _DEPO_CHECK_PAGES pages using native text extraction.
+    Requires either a strong deposition marker or two supporting signals.
+    """
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            pages = pdf.pages[:_DEPO_CHECK_PAGES]
+            text = "\n".join((p.extract_text() or "") for p in pages)
+    except Exception:
+        return False
+
+    if not text.strip():
+        return False
+
+    if _DEPO_STRONG_RE.search(text):
+        return True
+
+    return sum(1 for pat in _DEPO_SUPPORTING_RES if pat.search(text)) >= 2
+
+
+def _next_deposition_path(out_dir: Path) -> Path:
+    """Return the next available _deposition[_N].pdf path (not thread-safe on its own)."""
+    candidate = out_dir / "_deposition.pdf"
+    if not candidate.exists():
+        return candidate
+    i = 1
+    while True:
+        candidate = out_dir / f"_deposition_{i}.pdf"
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
 # CORE SCANNER
 
 
@@ -1192,6 +1276,56 @@ def scan_pdf(
         source_date_count=len(unique_dates),
         all_page_dates=all_page_dates,
     )
+
+
+def extract_page_text(pdf_path: str, page_num: int) -> str:
+    """Extract the text of a single page from a PDF (1-indexed page_num).
+
+    Mirrors the two-pass strategy used by scan_pdf: native pdfplumber first,
+    then Tesseract OCR if the native yield is below _MIN_NATIVE_CHARS.
+    Returns an empty string if the file is missing, the page is out of range,
+    or extraction fails for any reason.
+    """
+    try:
+        path = Path(pdf_path)
+        if not path.exists():
+            log.warning("extract_page_text: file not found: %s", pdf_path)
+            return ""
+
+        zero_idx = page_num - 1
+        with pdfplumber.open(pdf_path) as pdf:
+            if zero_idx < 0 or zero_idx >= len(pdf.pages):
+                log.warning(
+                    "extract_page_text: page %d out of range for %s (%d pages).",
+                    page_num,
+                    path.name,
+                    len(pdf.pages),
+                )
+                return ""
+            native = pdf.pages[zero_idx].extract_text() or ""
+
+        if len(native.strip()) >= _MIN_NATIVE_CHARS:
+            return native
+
+        # OCR fallback for image-heavy pages
+        try:
+            images = convert_from_path(
+                pdf_path,
+                poppler_path=_POPPLER_BIN,  # type: ignore[arg-type]
+                first_page=page_num,
+                last_page=page_num,
+                dpi=300,
+            )
+            if images:
+                return str(pytesseract.image_to_string(images[0]))
+        except Exception as exc:
+            log.warning("extract_page_text: OCR failed for page %d of %s: %s", page_num, path.name, exc)
+
+        return native  # return whatever native text we got, even if short
+
+    except Exception as exc:
+        log.warning("extract_page_text: failed for %s page %d: %s", pdf_path, page_num, exc)
+        return ""
 
 
 # OUTPUT WRITERS
@@ -1917,6 +2051,7 @@ def scan_directory(
         items.append((pdf_path, "_".join(rel_parts)))
 
     results: dict[str, ScanResult] = {}
+    _depo_lock = threading.Lock()
 
     def _scan_one(pdf_path: Path, safe_stem: str) -> tuple[str, ScanResult]:
         empty = ScanResult(
@@ -1929,6 +2064,16 @@ def scan_directory(
         )
         if progress_callback:
             progress_callback(f"Scanning {pdf_path.name}…")
+
+        if _is_deposition(str(pdf_path)):
+            with _depo_lock:
+                dest = _next_deposition_path(out_dir)
+                shutil.copy2(pdf_path, dest)
+            log.info("Deposition detected: %s → %s", pdf_path.name, dest.name)
+            if progress_callback:
+                progress_callback(f"Deposition saved: {dest.name}")
+            return safe_stem, empty
+
         try:
             result = scan_pdf(
                 str(pdf_path),

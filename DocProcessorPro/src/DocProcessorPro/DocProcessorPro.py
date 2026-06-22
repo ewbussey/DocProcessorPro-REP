@@ -11,9 +11,18 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import DocProcessorPro.resources_rc  # noqa: F401  — registers embedded Qt resources
+import DocProcessorPro.dpp_scripts.gui_files.resources_rc  # noqa: F401  — registers embedded Qt resources
 from PySide6.QtCore import QPointF, QSettings, QSize, QThread, QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImage, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtGui import (
+    QColor,
+    QDesktopServices,
+    QIcon,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -38,16 +47,73 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+
 def _apply_win_minmax(dialog: "QDialog") -> None:
     """Add minimize / maximize buttons on Windows.
 
-    Qt strips them from QDialog title bars by default; this restores the
-    standard Windows chrome without affecting macOS or Linux.
+    QDialog with a parent defaults to Qt.WindowType.Dialog, which maps to
+    WS_POPUP on Windows. WS_MINIMIZEBOX / WS_MAXIMIZEBOX are silently ignored
+    for popup-style windows — they only work on WS_OVERLAPPEDWINDOW. Switching
+    to Qt.WindowType.Window gives the overlapped style that respects the hint.
+    Modality from exec() is unaffected by this change.
     """
     if sys.platform == "win32":
         dialog.setWindowFlags(
-            dialog.windowFlags() | Qt.WindowType.WindowMinMaxButtonsHint
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowSystemMenuHint
+            | Qt.WindowType.WindowMinMaxButtonsHint
+            | Qt.WindowType.WindowCloseButtonHint
         )
+
+
+def _apply_app_icon(widget: "QDialog") -> None:
+    """Explicitly set the application icon on a widget.
+
+    app.setWindowIcon() propagates to new windows in Qt6, but QDialog
+    instances don't always honour it reliably across platforms. Calling this
+    on each dialog guarantees the title-bar icon is correct everywhere.
+    """
+    app = QApplication.instance()
+    if isinstance(app, QApplication):
+        widget.setWindowIcon(app.windowIcon())
+
+
+def _resolve_app_icon() -> "QIcon":
+    """Return the application icon with context-aware path resolution.
+
+    PyInstaller bundles: the Qt resource system (resources_rc.py) is compiled
+    in, so :/icons/app_icon.svg is tried first; the _MEIPASS extraction
+    directory is the fallback if the resource plugin is unavailable.
+
+    Editable / source installs: Qt's SVG iconengine plugin may not be on the
+    search path, so the physical SVG file (located relative to __file__) is
+    tried first; the Qt resource path is the fallback.
+    """
+    _SVG_RELPATH = (
+        Path(__file__).parent
+        / "dpp_scripts"
+        / "gui_files"
+        / "icons"
+        / "delivery_truck_speed_icon.svg"
+    )
+
+    if getattr(sys, "_MEIPASS", None):
+        # Running from a PyInstaller bundle — resources_rc is embedded and reliable.
+        icon = QIcon(":/icons/app_icon.svg")
+        if not icon.isNull():
+            return icon
+        # Secondary: file extracted alongside the exe in _MEIPASS.
+        p = Path(sys._MEIPASS) / "dpp_scripts" / "gui_files" / "icons" / "delivery_truck_speed_icon.svg"  # type: ignore[arg-type]
+        return QIcon(str(p)) if p.exists() else QIcon()
+
+    # Editable / source install — load the physical file first so icon
+    # rendering doesn't depend on Qt's plugin discovery being set up yet.
+    if _SVG_RELPATH.exists():
+        return QIcon(str(_SVG_RELPATH))
+
+    # Last resort: embedded Qt resource.
+    return QIcon(":/icons/app_icon.svg")
 
 
 # BACKGROUND WORKERS
@@ -57,7 +123,9 @@ class _ScanWorker(QThread):
     """Runs scan_directory() off the main thread."""
 
     progress = Signal(str)
-    finished = Signal(int, int, int)  # (pdfs_processed, total_matches, total_exclusions)
+    finished = Signal(
+        int, int, int
+    )  # (pdfs_processed, total_matches, total_exclusions)
     error = Signal(str)
 
     def __init__(
@@ -154,6 +222,7 @@ class ScannerDialog(QDialog):
     def __init__(self) -> None:
         super().__init__()
         _apply_win_minmax(self)
+        _apply_app_icon(self)
         self.setWindowTitle("DocProcessorPro — Keyword Scanner")
         self.setMinimumWidth(520)
         self._worker: _ScanWorker | None = None
@@ -381,7 +450,10 @@ class ScannerDialog(QDialog):
         # Derive a human-readable mode label for feedback tagging
         if self._affidavit_bills_check.isChecked():
             _mode = "affidavits_bills"
-        elif self._doc_section_check.isChecked() and self._require_anchor_check.isChecked():
+        elif (
+            self._doc_section_check.isChecked()
+            and self._require_anchor_check.isChecked()
+        ):
             _mode = "document_type_and_anchor"
         elif self._doc_section_check.isChecked():
             _mode = "document_type_filter"
@@ -410,7 +482,9 @@ class ScannerDialog(QDialog):
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
-    def _on_finished(self, pdf_count: int, match_count: int, exclusion_count: int) -> None:
+    def _on_finished(
+        self, pdf_count: int, match_count: int, exclusion_count: int
+    ) -> None:
         self._run_btn.setEnabled(True)
         out = self._output_edit.text().strip()
         self._settings.setValue("last_input_dir", self._input_edit.text().strip())
@@ -450,7 +524,9 @@ class ScannerDialog(QDialog):
             )
             return
         dlg = ReviewDialog(
-            pdf_path, csv_path, self._last_output_dir,
+            pdf_path,
+            csv_path,
+            self._last_output_dir,
             scan_settings=self._last_scan_settings,
             parent=self,
         )
@@ -480,7 +556,9 @@ class ScannerDialog(QDialog):
             )
             return
         dlg = ReviewDialog(
-            pdf_path, csv_path, self._last_output_dir,
+            pdf_path,
+            csv_path,
+            self._last_output_dir,
             scan_settings=self._last_scan_settings,
             mode="matched",
             parent=self,
@@ -510,29 +588,37 @@ class ScannerDialog(QDialog):
 
         # Auto-detect which review to open based on filename selected
         selected_name = Path(selected).name
-        open_matched = (
-            selected_name in ("_consolidated.pdf", "_matched_review_draft.json",
-                              "_matched_feedback.jsonl")
-            or selected_name.endswith("_matched_manifest.csv")
-        )
+        open_matched = selected_name in (
+            "_consolidated.pdf",
+            "_matched_review_draft.json",
+            "_matched_feedback.jsonl",
+        ) or selected_name.endswith("_matched_manifest.csv")
 
         if open_matched:
             pdf_path = output_dir / "_consolidated.pdf"
             csv_path = output_dir / "_consolidated_matched_manifest.csv"
             if not pdf_path.exists():
-                QMessageBox.warning(self, "No Consolidated PDF Found",
-                    "No _consolidated.pdf found in the selected folder.")
+                QMessageBox.warning(
+                    self,
+                    "No Consolidated PDF Found",
+                    "No _consolidated.pdf found in the selected folder.",
+                )
                 return
             if not csv_path.exists():
-                QMessageBox.warning(self, "No Matched Manifest Found",
+                QMessageBox.warning(
+                    self,
+                    "No Matched Manifest Found",
                     "_consolidated_matched_manifest.csv not found.\n\n"
-                    "Re-run the scan to generate this manifest.")
+                    "Re-run the scan to generate this manifest.",
+                )
                 return
             settings_dlg = _ScanSettingsDialog(parent=self)
             if settings_dlg.exec() != QDialog.DialogCode.Accepted:
                 return
             dlg = ReviewDialog(
-                pdf_path, csv_path, output_dir,
+                pdf_path,
+                csv_path,
+                output_dir,
                 scan_settings=settings_dlg.scan_settings,
                 mode="matched",
                 parent=self,
@@ -541,15 +627,20 @@ class ScannerDialog(QDialog):
             pdf_path = output_dir / "_consolidated_unmatched.pdf"
             csv_path = output_dir / "_consolidated_unmatched_manifest.csv"
             if not pdf_path.exists():
-                QMessageBox.warning(self, "No Unmatched PDF Found",
+                QMessageBox.warning(
+                    self,
+                    "No Unmatched PDF Found",
                     "No _consolidated_unmatched.pdf found in the selected folder.\n\n"
-                    "Please select a file inside a folder that contains scan output.")
+                    "Please select a file inside a folder that contains scan output.",
+                )
                 return
             settings_dlg = _ScanSettingsDialog(parent=self)
             if settings_dlg.exec() != QDialog.DialogCode.Accepted:
                 return
             dlg = ReviewDialog(
-                pdf_path, csv_path, output_dir,
+                pdf_path,
+                csv_path,
+                output_dir,
                 scan_settings=settings_dlg.scan_settings,
                 parent=self,
             )
@@ -561,7 +652,9 @@ class ScannerDialog(QDialog):
         if dlg._apply_result is not None:
             primary, skipped = dlg._apply_result
             if dlg._mode == "matched":
-                msg = f"Review complete — {primary} page(s) kept in consolidated output."
+                msg = (
+                    f"Review complete — {primary} page(s) kept in consolidated output."
+                )
             else:
                 msg = f"Review complete — {primary} page(s) applied to consolidated output."
             if skipped:
@@ -615,7 +708,9 @@ class _FeedbackWorker(QThread):
     """Runs apply_feedback() or apply_matched_feedback() off the main thread."""
 
     progress = Signal(str)
-    finished = Signal(int, int, int)  # (pages_approved_or_kept, pages_rejected, pages_skipped)
+    finished = Signal(
+        int, int, int
+    )  # (pages_approved_or_kept, pages_rejected, pages_skipped)
     error = Signal(str)
 
     def __init__(
@@ -635,6 +730,7 @@ class _FeedbackWorker(QThread):
                 from DocProcessorPro.dpp_scripts.keyword_scanner_scripts.keyword_scanner_codebase import (
                     apply_matched_feedback,
                 )
+
                 kept, removed, skipped = apply_matched_feedback(
                     self._output_dir,
                     self._feedback_path,
@@ -645,6 +741,7 @@ class _FeedbackWorker(QThread):
                 from DocProcessorPro.dpp_scripts.keyword_scanner_scripts.keyword_scanner_codebase import (
                     apply_feedback,
                 )
+
                 approved, rejected, skipped = apply_feedback(
                     self._output_dir,
                     self._feedback_path,
@@ -657,40 +754,64 @@ class _FeedbackWorker(QThread):
 
 # Therapy triage classification constants — module level so they're computed once
 _THERAPY_CATS: frozenset[str] = frozenset({"THERAPY", "BEHAVIORAL_HEALTH"})
-_INTAKE_KW: frozenset[str] = frozenset({
-    "initial evaluation", "intake note", "intake assessment",
-    "initial assessment", "initial session", "first session",
-    "first visit", "initial visit", "initial psychiatric",
-    "psychological evaluation", "evaluation and management",
-    # regex-produced verbatim matches from CATEGORY_DOCUMENT_TYPE pattern:
-    "initial summary", "initial note", "initial report",
-    "initial history", "intake summary", "intake report",
-})
-_DISCHARGE_KW: frozenset[str] = frozenset({
-    "discharge note", "discharge summary", "termination note",
-    "termination summary", "termination session", "final session",
-    "final visit", "final note", "treatment termination", "discharge plan",
-    # regex-produced:
-    "discharge report", "discharge history", "termination report",
-})
+_INTAKE_KW: frozenset[str] = frozenset(
+    {
+        "initial evaluation",
+        "intake note",
+        "intake assessment",
+        "initial assessment",
+        "initial session",
+        "first session",
+        "first visit",
+        "initial visit",
+        "initial psychiatric",
+        "psychological evaluation",
+        "evaluation and management",
+        # regex-produced verbatim matches from CATEGORY_DOCUMENT_TYPE pattern:
+        "initial summary",
+        "initial note",
+        "initial report",
+        "initial history",
+        "intake summary",
+        "intake report",
+    }
+)
+_DISCHARGE_KW: frozenset[str] = frozenset(
+    {
+        "discharge note",
+        "discharge summary",
+        "termination note",
+        "termination summary",
+        "termination session",
+        "final session",
+        "final visit",
+        "final note",
+        "treatment termination",
+        "discharge plan",
+        # regex-produced:
+        "discharge report",
+        "discharge history",
+        "termination report",
+    }
+)
 # Non-therapy clinical categories that are auto-approved when unique
-_AUTO_APPROVE_CATS: frozenset[str] = frozenset({
-    "IMAGING", "INJURY_LEGAL", "VOCATIONAL", "BILLING", "MEDICAL_TREATMENT"
-})
+_AUTO_APPROVE_CATS: frozenset[str] = frozenset(
+    {"IMAGING", "INJURY_LEGAL", "VOCATIONAL", "BILLING", "MEDICAL_TREATMENT"}
+)
 
 # Background colors keyed by (decision, decision_source)
 _DECISION_COLORS: dict[tuple[str, str], tuple[int, int, int]] = {
-    ("approved",            "user"):                 (200, 255, 200),  # green
-    ("rejected_duplicate",  "user"):                 (255, 210, 140),  # orange
-    ("rejected_irrelevant", "user"):                 (255, 200, 200),  # red
-    ("approved",            "smart_triage"):         (185, 215, 255),  # pale blue
-    ("rejected_duplicate",  "smart_triage"):         (255, 255, 185),  # pale yellow
-    ("rejected_irrelevant", "smart_triage"):         (235, 205, 255),  # pale lavender
-    ("approved",            "find_duplicates"):      (200, 255, 200),  # same green
-    ("rejected_duplicate",  "find_duplicates"):      (255, 225, 190),  # pale peach
-    ("rejected_irrelevant", "find_duplicates"):      (255, 200, 200),  # same red
-    ("approved",            "matched_mode_default"): (200, 235, 255),  # pale cyan
-    ("rejected_duplicate",  "matched_mode_default"): (255, 210, 140),  # orange
+    ("approved", "user"): (200, 255, 200),  # green
+    ("rejected_duplicate", "user"): (255, 210, 140),  # orange
+    ("rejected_irrelevant", "user"): (255, 200, 200),  # red
+    ("approved", "smart_triage"): (185, 215, 255),  # pale blue
+    ("rejected_duplicate", "smart_triage"): (255, 255, 185),  # pale yellow
+    ("rejected_irrelevant", "smart_triage"): (235, 205, 255),  # pale lavender
+    ("approved", "find_duplicates"): (200, 255, 200),  # same green
+    ("rejected_duplicate", "find_duplicates"): (255, 225, 190),  # pale peach
+    ("rejected_irrelevant", "find_duplicates"): (255, 200, 200),  # same red
+    ("approved", "matched_mode_default"): (200, 235, 255),  # pale cyan
+    ("rejected_duplicate", "matched_mode_default"): (255, 210, 140),  # orange
     ("rejected_irrelevant", "matched_mode_default"): (255, 200, 200),  # red
 }
 
@@ -698,7 +819,8 @@ _DECISION_COLORS: dict[tuple[str, str], tuple[int, int, int]] = {
 def _dhash(qimage: "QImage") -> int:
     """64-bit difference hash: horizontal gradient over a 9×8 grayscale thumbnail."""
     gray = qimage.convertToFormat(QImage.Format.Format_Grayscale8).scaled(
-        QSize(9, 8), Qt.AspectRatioMode.IgnoreAspectRatio,
+        QSize(9, 8),
+        Qt.AspectRatioMode.IgnoreAspectRatio,
         Qt.TransformationMode.SmoothTransformation,
     )
     bits = gray.bits()
@@ -750,6 +872,7 @@ class _DedupDialog(QDialog):
     ) -> None:
         super().__init__(parent)
         _apply_win_minmax(self)
+        _apply_app_icon(self)
         self._groups = groups
         self._cur_decisions = decisions
         self._cur_sources = decision_sources
@@ -819,17 +942,21 @@ class _DedupDialog(QDialog):
                 item_l.setSpacing(2)
                 item_l.setContentsMargins(4, 4, 4, 4)
 
-                # Composite onto a white background so pages with a transparent
-                # alpha layer (common in scanned PDFs) render correctly in dark mode
-                white = QPixmap(qimg.width(), qimg.height())
-                white.fill(Qt.GlobalColor.white)
-                painter = QPainter(white)
+                # Use an RGB32 canvas (no alpha channel) so any format returned by
+                # QPdfDocument.render() — ARGB32 or ARGB32_Premultiplied — composites
+                # correctly over white. A QPixmap canvas has a platform-native format
+                # that can mismatch premultiplied sources and produce black thumbnails.
+                canvas = QImage(qimg.width(), qimg.height(), QImage.Format.Format_RGB32)
+                canvas.fill(Qt.GlobalColor.white)
+                painter = QPainter(canvas)
                 painter.drawImage(0, 0, qimg)
                 painter.end()
+                white = QPixmap.fromImage(canvas)
                 thumb = QLabel()
                 thumb.setPixmap(
                     white.scaled(
-                        220, 286,
+                        220,
+                        286,
                         Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.SmoothTransformation,
                     )
@@ -843,9 +970,7 @@ class _DedupDialog(QDialog):
                 pg = row.get("page_num", "?")
                 cur_dec = self._cur_decisions.get(row_idx)
                 cur_src = self._cur_sources.get(row_idx, "—")
-                status = (
-                    f"{cur_dec} ({cur_src})" if cur_dec else "undecided"
-                )
+                status = f"{cur_dec} ({cur_src})" if cur_dec else "undecided"
                 info = QLabel(f"{filename}\np.{pg}  score {score:.2f}\n{status}")
                 info.setWordWrap(True)
                 info.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -864,7 +989,9 @@ class _DedupDialog(QDialog):
             btn_row.addStretch()
             best_btn = QPushButton("Keep Highest Scored")
             best_btn.clicked.connect(
-                lambda _, c=checks: [chk.setChecked(i == 0) for i, (_, chk) in enumerate(c)]
+                lambda _, c=checks: [
+                    chk.setChecked(i == 0) for i, (_, chk) in enumerate(c)
+                ]
             )
             btn_row.addWidget(best_btn)
             frame_layout.addLayout(btn_row)
@@ -906,17 +1033,18 @@ class _ScanSettingsDialog(QDialog):
     """
 
     _MODE_ITEMS: list[tuple[str, "str | None"]] = [
-        ("Don't specify",                    None),
-        ("Standard (full clinical scan)",    "standard"),
-        ("Affidavits + Bills only",          "affidavits_bills"),
-        ("Document type filter",             "document_type_filter"),
-        ("Clinical anchor required",         "clinical_anchor"),
-        ("Document type + clinical anchor",  "document_type_and_anchor"),
+        ("Don't specify", None),
+        ("Standard (full clinical scan)", "standard"),
+        ("Affidavits + Bills only", "affidavits_bills"),
+        ("Document type filter", "document_type_filter"),
+        ("Clinical anchor required", "clinical_anchor"),
+        ("Document type + clinical anchor", "document_type_and_anchor"),
     ]
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         _apply_win_minmax(self)
+        _apply_app_icon(self)
         self.setWindowTitle("Scan Settings")
         self.setMinimumWidth(380)
         self._result: "dict | None" = None
@@ -986,19 +1114,19 @@ class _ScanSettingsDialog(QDialog):
             self._result = None
         else:
             _require: "dict[str, tuple[list[str] | None, bool]]" = {
-                "standard":                  (None,                          False),
-                "affidavits_bills":          (["BILLING", "INJURY_LEGAL"],   False),
-                "document_type_filter":      (["DOCUMENT_TYPE"],             False),
-                "clinical_anchor":           (None,                          True),
-                "document_type_and_anchor":  (["DOCUMENT_TYPE"],             True),
+                "standard": (None, False),
+                "affidavits_bills": (["BILLING", "INJURY_LEGAL"], False),
+                "document_type_filter": (["DOCUMENT_TYPE"], False),
+                "clinical_anchor": (None, True),
+                "document_type_and_anchor": (["DOCUMENT_TYPE"], True),
             }
             require_categories, require_anchor = _require[mode]
             self._result = {
-                "scan_mode":          mode,
-                "min_hits":           self._min_hits_spin.value(),
-                "page_buffer":        self._page_buffer_spin.value(),
+                "scan_mode": mode,
+                "min_hits": self._min_hits_spin.value(),
+                "page_buffer": self._page_buffer_spin.value(),
                 "require_categories": require_categories,
-                "require_anchor":     require_anchor,
+                "require_anchor": require_anchor,
             }
         self.accept()
 
@@ -1034,6 +1162,7 @@ class ReviewDialog(QDialog):
 
         super().__init__(parent)
         _apply_win_minmax(self)
+        _apply_app_icon(self)
         self._mode = mode
         if mode == "matched":
             self.setWindowTitle("DocProcessorPro — Review Matched Pages")
@@ -1044,21 +1173,29 @@ class ReviewDialog(QDialog):
         self._output_dir = _Path(output_dir)
         if mode == "matched":
             self._feedback_path = self._output_dir / "_matched_feedback.jsonl"
-            self._draft_path    = self._output_dir / "_matched_review_draft.json"
+            self._draft_path = self._output_dir / "_matched_review_draft.json"
         else:
             self._feedback_path = self._output_dir / "_feedback.jsonl"
-            self._draft_path    = self._output_dir / "_review_draft.json"
+            self._draft_path = self._output_dir / "_review_draft.json"
         self._fb_worker: _FeedbackWorker | None = None
         self._scan_settings: "dict | None" = scan_settings
-        self._apply_result: "tuple[int, int] | None" = None  # (approved, skipped) set on successful apply
+        self._apply_result: "tuple[int, int] | None" = (
+            None  # (approved, skipped) set on successful apply
+        )
 
         self._rows: list[dict] = []
         self._subtypes: list[str | None] = []  # parallel to _rows
-        self._decisions: dict[int, str] = {}         # row_index → "approved" | "rejected_*"
+        self._decisions: dict[int, str] = {}  # row_index → "approved" | "rejected_*"
         self._triage_decisions: dict[int, str] = {}  # snapshot after Smart Triage runs
-        self._decision_sources: dict[int, str] = {}  # row_index → "user"|"smart_triage"|"find_duplicates"|"matched_mode_default"
-        self._dedup_groups: dict[int, int] = {}      # row_index → cluster id from last Find Duplicates run
-        self._dedup_canonical: set[int] = set()      # indices identified as canonical in their dedup cluster
+        self._decision_sources: dict[
+            int, str
+        ] = {}  # row_index → "user"|"smart_triage"|"find_duplicates"|"matched_mode_default"
+        self._dedup_groups: dict[
+            int, int
+        ] = {}  # row_index → cluster id from last Find Duplicates run
+        self._dedup_canonical: set[int] = (
+            set()
+        )  # indices identified as canonical in their dedup cluster
         self._current_index: int = -1
 
         self._load_manifest(manifest_csv)
@@ -1125,14 +1262,15 @@ class ReviewDialog(QDialog):
             else:
                 reason = rec.get("rejection_reason", "irrelevant")
                 decision = (
-                    "rejected_duplicate" if reason == "duplicate" else "rejected_irrelevant"
+                    "rejected_duplicate"
+                    if reason == "duplicate"
+                    else "rejected_irrelevant"
                 )
             source = rec.get("decision_source", "user")
             for idx, row in enumerate(self._rows):
-                if (
-                    row.get("source_pdf_path") == src
-                    and int(row.get("page_num", 0)) == int(pg)
-                ):
+                if row.get("source_pdf_path") == src and int(
+                    row.get("page_num", 0)
+                ) == int(pg):
                     self._decisions[idx] = decision
                     self._decision_sources[idx] = source
                     break
@@ -1163,10 +1301,10 @@ class ReviewDialog(QDialog):
         ]
 
         draft = {
-            "decisions":            _to_stable(self._decisions),
-            "triage_decisions":     _to_stable(self._triage_decisions),
-            "decision_sources":     _to_stable(self._decision_sources),
-            "dedup_group_ids":      _to_stable(self._dedup_groups),
+            "decisions": _to_stable(self._decisions),
+            "triage_decisions": _to_stable(self._triage_decisions),
+            "decision_sources": _to_stable(self._decision_sources),
+            "dedup_group_ids": _to_stable(self._dedup_groups),
             "dedup_canonical_keys": dedup_canonical_keys,
         }
         tmp = self._draft_path.with_suffix(".tmp")
@@ -1428,14 +1566,14 @@ class ReviewDialog(QDialog):
         )
         subtype = self._subtypes[index] if index < len(self._subtypes) else None
         type_display = {
-            "intake":     "Intake / Initial",
-            "discharge":  "Discharge / Termination",
-            "progress":   "Progress Note",
-            "imaging":    "Imaging Report",
-            "legal":      "Legal / Affidavit",
-            "medical":    "Medical Treatment",
+            "intake": "Intake / Initial",
+            "discharge": "Discharge / Termination",
+            "progress": "Progress Note",
+            "imaging": "Imaging Report",
+            "legal": "Legal / Affidavit",
+            "medical": "Medical Treatment",
             "vocational": "Vocational",
-            "billing":    "Billing Record",
+            "billing": "Billing Record",
         }.get(subtype or "", "—")
         self._meta_labels["Type"].setText(type_display)
         self._meta_labels["Score"].setText(f"{score:.2f}")
@@ -1468,14 +1606,14 @@ class ReviewDialog(QDialog):
             prefix = "[DUP]      "
         else:
             prefix = {
-                "intake":     "[INTAKE]   ",
-                "discharge":  "[DISCHARGE]",
-                "progress":   "[PROG]     ",
-                "imaging":    "[IMAGING]  ",
-                "legal":      "[LEGAL]    ",
-                "medical":    "[MEDICAL]  ",
+                "intake": "[INTAKE]   ",
+                "discharge": "[DISCHARGE]",
+                "progress": "[PROG]     ",
+                "imaging": "[IMAGING]  ",
+                "legal": "[LEGAL]    ",
+                "medical": "[MEDICAL]  ",
                 "vocational": "[VOC]      ",
-                "billing":    "[BILLING]  ",
+                "billing": "[BILLING]  ",
             }.get(subtype or "", "           ")
         return f"{prefix} {stem}\n           p.{pg}  score {score:.2f}"
 
@@ -1540,9 +1678,7 @@ class ReviewDialog(QDialog):
             if src in sources_with_intake_discharge:
                 continue
             progress = [
-                (idx, self._rows[idx])
-                for idx, sub in items
-                if sub == "progress"
+                (idx, self._rows[idx]) for idx, sub in items if sub == "progress"
             ]
             if not progress:
                 continue
@@ -1556,7 +1692,7 @@ class ReviewDialog(QDialog):
                 return max(ds) if ds else "0000-00-00"
 
             first_idx = min(progress, key=lambda t: _min_date(t[1]))[0]
-            last_idx  = max(progress, key=lambda t: _max_date(t[1]))[0]
+            last_idx = max(progress, key=lambda t: _max_date(t[1]))[0]
             for idx in {first_idx, last_idx}:
                 if idx not in self._decisions:
                     self._decisions[idx] = "approved"
@@ -1580,11 +1716,11 @@ class ReviewDialog(QDialog):
 
         # Step 4: auto-approve non-therapy clinical pages, tracking per-category counts
         _CAT_LABELS: list[tuple[str, str]] = [
-            ("Legal / Affidavit",  "INJURY_LEGAL"),
-            ("Imaging",            "IMAGING"),
-            ("Billing",            "BILLING"),
-            ("Medical Treatment",  "MEDICAL_TREATMENT"),
-            ("Vocational",         "VOCATIONAL"),
+            ("Legal / Affidavit", "INJURY_LEGAL"),
+            ("Imaging", "IMAGING"),
+            ("Billing", "BILLING"),
+            ("Medical Treatment", "MEDICAL_TREATMENT"),
+            ("Vocational", "VOCATIONAL"),
         ]
         cat_approve_counts: dict[str, int] = {}
         for idx, row in enumerate(self._rows):
@@ -1648,18 +1784,23 @@ class ReviewDialog(QDialog):
         """
         try:
             from PySide6.QtPdf import QPdfDocument
+
             if not isinstance(self._pdf_doc, QPdfDocument):
                 raise RuntimeError("not loaded")
         except Exception:
             QMessageBox.warning(
-                self, "PDF Not Available",
-                "The PDF viewer must be active to run Find Duplicates."
+                self,
+                "PDF Not Available",
+                "The PDF viewer must be active to run Find Duplicates.",
             )
             return
 
         if len(self._rows) < 2:
-            QMessageBox.information(self, "Not Enough Pages",
-                                    "Need at least 2 pages for duplicate detection.")
+            QMessageBox.information(
+                self,
+                "Not Enough Pages",
+                "Need at least 2 pages for duplicate detection.",
+            )
             return
 
         prev_label = self._progress_label.text()
@@ -1681,8 +1822,9 @@ class ReviewDialog(QDialog):
         self._progress_label.setText(prev_label)
 
         if len(hashes) < 2:
-            QMessageBox.information(self, "No Results",
-                                    "Could not render enough pages for comparison.")
+            QMessageBox.information(
+                self, "No Results", "Could not render enough pages for comparison."
+            )
             return
 
         raw_clusters = _cluster_by_hash(hashes, threshold=10)
@@ -1690,8 +1832,9 @@ class ReviewDialog(QDialog):
 
         if not groups:
             QMessageBox.information(
-                self, "No Duplicates Found",
-                "No visually similar pages were detected across the full page set."
+                self,
+                "No Duplicates Found",
+                "No visually similar pages were detected across the full page set.",
             )
             return
 
@@ -1699,13 +1842,19 @@ class ReviewDialog(QDialog):
         self._dedup_groups = {}
         self._dedup_canonical = set()
         for g_id, group in enumerate(groups):
-            canonical = max(group, key=lambda i: float(self._rows[i].get("total_hits", 0)))
+            canonical = max(
+                group, key=lambda i: float(self._rows[i].get("total_hits", 0))
+            )
             self._dedup_canonical.add(canonical)
             for idx in group:
                 self._dedup_groups[idx] = g_id
 
         dialog_groups = [
-            [(idx, self._rows[idx], thumbnails[idx]) for idx in grp if idx in thumbnails]
+            [
+                (idx, self._rows[idx], thumbnails[idx])
+                for idx in grp
+                if idx in thumbnails
+            ]
             for grp in groups
         ]
         dialog_groups = [g for g in dialog_groups if len(g) >= 2]
@@ -1805,7 +1954,11 @@ class ReviewDialog(QDialog):
         self._decision_sources[self._current_index] = "user"
         item = self._list.item(self._current_index)
         if item:
-            item.setText(self._make_list_item_text(self._current_index, self._rows[self._current_index]))
+            item.setText(
+                self._make_list_item_text(
+                    self._current_index, self._rows[self._current_index]
+                )
+            )
             color = self._item_color(self._current_index)
             if color:
                 item.setBackground(color)
@@ -1878,6 +2031,9 @@ class ReviewDialog(QDialog):
     def _export_feedback(self) -> None:
         import json
         from datetime import datetime
+        from DocProcessorPro.dpp_scripts.keyword_scanner_scripts.keyword_scanner_codebase import (
+            extract_page_text,
+        )
 
         # Load any existing records keyed by (source_pdf_path, page_num)
         existing: dict[tuple[str, int], dict] = {}
@@ -1945,11 +2101,12 @@ class ReviewDialog(QDialog):
                 "schema_version": 1,
                 "label": label_str,
                 "rejection_reason": rejection_reason,
-                "scanner_decision": self._mode,        # "matched" | "unmatched"
+                "scanner_decision": self._mode,  # "matched" | "unmatched"
                 "decision_source": self._decision_sources.get(idx, "user"),
                 "triage_label": triage_label_str,
                 "triage_rejection_reason": triage_rejection_reason,
-                "triage_override": triage_label_str is not None and triage_label_str != label_str,
+                "triage_override": triage_label_str is not None
+                and triage_label_str != label_str,
                 "find_duplicates_group_id": dedup_group_id,
                 "find_duplicates_is_canonical": dedup_is_canonical,
                 "find_duplicates_suggestion": dedup_suggestion,
@@ -1973,6 +2130,8 @@ class ReviewDialog(QDialog):
                 "date_count": len(
                     [d for d in row.get("dates_on_page", "").split("|") if d]
                 ),
+                "page_text": extract_page_text(src, pg)
+                or existing.get((src, pg), {}).get("page_text", ""),
             }
             existing[(src, pg)] = rec
 
@@ -1997,13 +2156,15 @@ class ReviewDialog(QDialog):
     def _apply_approved(self) -> None:
         if self._mode == "matched":
             remove_count = sum(
-                1 for d in self._decisions.values()
+                1
+                for d in self._decisions.values()
                 if d in ("rejected_duplicate", "rejected_irrelevant")
             )
             if remove_count == 0:
                 QMessageBox.information(
-                    self, "Nothing to Remove",
-                    "No pages have been marked for removal yet."
+                    self,
+                    "Nothing to Remove",
+                    "No pages have been marked for removal yet.",
                 )
                 return
             reply = QMessageBox.question(
@@ -2016,9 +2177,7 @@ class ReviewDialog(QDialog):
                 QMessageBox.StandardButton.No,
             )
         else:
-            approved_count = sum(
-                1 for d in self._decisions.values() if d == "approved"
-            )
+            approved_count = sum(1 for d in self._decisions.values() if d == "approved")
             if approved_count == 0:
                 QMessageBox.information(
                     self, "Nothing to Apply", "No pages have been approved yet."
@@ -2094,6 +2253,18 @@ def _suppress_subprocess_windows() -> None:
 def main() -> None:
     _suppress_subprocess_windows()
 
+    # Windows: tell the shell this process has its own identity so the taskbar
+    # shows the custom icon instead of the generic Python launcher icon.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "DocProcessorPro.KeywordScanner.1"
+            )
+        except Exception:
+            pass
+
     from DocProcessorPro.logging_resources.log_context import setup_logging
     from DocProcessorPro.dpp_scripts.update_scripts.update_codebase import (
         save_install_location,
@@ -2103,9 +2274,22 @@ def main() -> None:
     save_install_location()
 
     app: QApplication = QApplication.instance() or QApplication(sys.argv)  # type: ignore[assignment]
-    app.setWindowIcon(QIcon(":/icons/app_icon.svg"))
+    _icon = _resolve_app_icon()
+    app.setWindowIcon(_icon)
     dialog = ScannerDialog()
     dialog.show()
+
+    # The platform taskbar/dock button isn't created until after the event loop
+    # starts, so re-apply the icon via a short timer once the window handle exists.
+    def _apply_taskbar_icon() -> None:
+        _app = QApplication.instance()
+        if isinstance(_app, QApplication):
+            _app.setWindowIcon(_icon)
+            for w in _app.topLevelWidgets():
+                w.setWindowIcon(_icon)
+
+    QTimer.singleShot(200, _apply_taskbar_icon)
+
     sys.exit(app.exec())
 
 
