@@ -8,11 +8,14 @@ prior to consolidation.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
 import DocProcessorPro.dpp_scripts.gui_files.resources_rc  # noqa: F401  — registers embedded Qt resources
-from PySide6.QtCore import QPointF, QSettings, QSize, QThread, QTimer, QUrl, Qt, Signal
+from typing import NamedTuple
+
+from PySide6.QtCore import QPointF, QSettings, QSize, QStringListModel, QThread, QTimer, QUrl, Qt, Signal
 from PySide6.QtGui import (
     QColor,
     QDesktopServices,
@@ -27,6 +30,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QCompleter,
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
@@ -45,6 +49,14 @@ from PySide6.QtWidgets import (
     QSplitter,
     QVBoxLayout,
     QWidget,
+)
+
+
+# Matches "{LastName(s)}, {FirstName(s)} {CaseNumber}" folder names.
+# Allows hyphens, apostrophes, and accented characters in name components.
+_CLAIMANT_FOLDER_RE = re.compile(
+    r"^[A-Za-z'’À-ɏ\-]+(?:\s+[A-Za-z'’À-ɏ\-]+)*"
+    r",\s+\S.*\s+\S+\s*$"
 )
 
 
@@ -233,6 +245,7 @@ class ScannerDialog(QDialog):
         self._last_output_dir: "Path | None" = None
         self._last_scan_settings: "dict | None" = None
         self._last_browsed_dir: str = ""
+        self._auto_derived_output: str = ""  # last value written by auto-derivation
         self._build_ui()
         # Defer update check until after the event loop starts
         QTimer.singleShot(2000, self._start_update_check)
@@ -413,6 +426,59 @@ class ScannerDialog(QDialog):
             self._input_edit.setText(path)
             self._settings.setValue("last_input_dir", path)
             self._last_browsed_dir = path
+            self._try_derive_output(path)
+
+    def _try_derive_output(self, input_path: str) -> None:
+        """Auto-fill the output field from the claimant folder structure, if possible.
+
+        Only overwrites the output field when it is empty or still shows the
+        previous auto-derived value (i.e. the user has not manually changed it).
+        """
+        derived = self._derive_output_from_input(input_path)
+        if not derived:
+            return
+        current = self._output_edit.text().strip()
+        if current and current != self._auto_derived_output:
+            return  # user has manually set the output — leave it alone
+        self._output_edit.setText(derived)
+        self._auto_derived_output = derived
+        self._settings.setValue("last_output_dir", derived)
+
+    def _derive_output_from_input(self, input_path: str) -> str | None:
+        """Walk up from input_path to find a claimant folder, then build the
+        canonical output path: {root}/dpp_outputs/{Initial}/{ClaimantFolder}/
+        """
+        p = Path(input_path)
+        if not p.exists():
+            return None
+
+        # Walk toward the filesystem root looking for a claimant-pattern folder.
+        current = p
+        claimant_folder: Path | None = None
+        while True:
+            if _CLAIMANT_FOLDER_RE.match(current.name):
+                claimant_folder = current
+                break
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+
+        if claimant_folder is None:
+            return None
+
+        letter_folder = claimant_folder.parent
+        if len(letter_folder.name) == 1 and letter_folder.name.isalpha():
+            # Standard structure: root/A/Smith, John 1234/
+            root = letter_folder.parent
+            initial = letter_folder.name.upper()
+        else:
+            # Letter folder absent — derive initial from last name
+            last_name = claimant_folder.name.split(",")[0].strip()
+            initial = last_name[0].upper() if last_name else "X"
+            root = letter_folder
+
+        return str(root / "dpp_outputs" / initial / claimant_folder.name)
 
     def _browse_output(self) -> None:
         start = self._output_edit.text().strip() or self._last_browsed_dir
@@ -421,6 +487,8 @@ class ScannerDialog(QDialog):
             self._output_edit.setText(path)
             self._settings.setValue("last_output_dir", path)
             self._last_browsed_dir = path
+            # User manually chose the output — disable further auto-derivation.
+            self._auto_derived_output = ""
 
     # SCAN
 
@@ -854,6 +922,17 @@ def _cluster_by_hash(
     return clusters
 
 
+class _ClickableLabel(QLabel):
+    """QLabel that emits clicked() when left-clicked."""
+
+    clicked = Signal()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
 class _DedupDialog(QDialog):
     """Side-by-side comparison dialog for groups of visually similar pages.
 
@@ -868,6 +947,7 @@ class _DedupDialog(QDialog):
         groups: list[list[tuple[int, dict, "QImage"]]],
         decisions: dict[int, str],
         decision_sources: dict[int, str],
+        hi_res: "dict[int, QImage] | None" = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -876,6 +956,7 @@ class _DedupDialog(QDialog):
         self._groups = groups
         self._cur_decisions = decisions
         self._cur_sources = decision_sources
+        self._hi_res: dict[int, QImage] = hi_res or {}
         total = sum(len(g) for g in groups)
         self.setWindowTitle(
             f"Find Duplicates — {len(groups)} group(s), {total} similar pages"
@@ -952,7 +1033,7 @@ class _DedupDialog(QDialog):
                 painter.drawImage(0, 0, qimg)
                 painter.end()
                 white = QPixmap.fromImage(canvas)
-                thumb = QLabel()
+                thumb = _ClickableLabel()
                 thumb.setPixmap(
                     white.scaled(
                         220,
@@ -962,6 +1043,11 @@ class _DedupDialog(QDialog):
                     )
                 )
                 thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                thumb.setCursor(Qt.CursorShape.PointingHandCursor)
+                thumb.setToolTip("Click to enlarge")
+                thumb.clicked.connect(
+                    lambda _checked=False, i=row_idx, q=qimg: self._zoom_page(i, q)
+                )
                 item_l.addWidget(thumb)
 
                 src_path = row.get("source_pdf_path", "")
@@ -1013,6 +1099,60 @@ class _DedupDialog(QDialog):
         bottom.addWidget(apply_btn)
         bottom.addWidget(cancel_btn)
         root.addLayout(bottom)
+
+    def _zoom_page(self, row_idx: int, qimg_lo: "QImage") -> None:
+        """Open a scrollable full-resolution popup for the given page."""
+        # Prefer the hi-res render when available; fall back to the thumbnail image.
+        src = self._hi_res.get(row_idx, qimg_lo)
+
+        # Composite onto white (same logic as the thumbnail path).
+        canvas = QImage(src.width(), src.height(), QImage.Format.Format_RGB32)
+        canvas.fill(Qt.GlobalColor.white)
+        p = QPainter(canvas)
+        p.drawImage(0, 0, src)
+        p.end()
+        full_pix = QPixmap.fromImage(canvas)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Page Preview")
+        _apply_win_minmax(dlg)
+
+        # Scale to fit 85 % of the available screen, preserving aspect ratio.
+        screen = QApplication.primaryScreen()
+        if screen:
+            avail = screen.availableGeometry()
+            max_w = int(avail.width() * 0.85)
+            max_h = int(avail.height() * 0.85)
+        else:
+            max_w, max_h = 1200, 900
+
+        scaled_pix = full_pix.scaled(
+            max_w,
+            max_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+        img_label = QLabel()
+        img_label.setPixmap(scaled_pix)
+        img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        scroll = QScrollArea()
+        scroll.setWidget(img_label)
+        scroll.setWidgetResizable(False)
+        scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+        layout.addWidget(scroll)
+        layout.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignRight)
+
+        dlg.resize(min(scaled_pix.width() + 40, max_w), min(scaled_pix.height() + 80, max_h))
+        dlg.exec()
 
     def results(self) -> tuple[list[int], list[int]]:
         """Return (keep_indices, reject_indices) based on checkbox state."""
@@ -1135,6 +1275,25 @@ class _ScanSettingsDialog(QDialog):
         return self._result
 
 
+_MAX_UNDO_DEPTH = 50
+
+
+class _ReviewSnapshot(NamedTuple):
+    """Immutable capture of all mutable ReviewDialog decision state."""
+
+    decisions: dict
+    decision_sources: dict
+    triage_decisions: dict
+    service_date_overrides: dict
+    provider_npi_overrides: dict
+    provider_name_overrides: dict
+    provider_assigned: dict
+    dedup_groups: dict
+    dedup_canonical: set
+    rows: list
+    subtypes: list
+
+
 class ReviewDialog(QDialog):
     """Three-panel review window for auditing keyword-scanner page decisions.
 
@@ -1197,6 +1356,19 @@ class ReviewDialog(QDialog):
             set()
         )  # indices identified as canonical in their dedup cluster
         self._current_index: int = -1
+        self._undo_stack: list[_ReviewSnapshot] = []
+        self._redo_stack: list[_ReviewSnapshot] = []
+
+        # Field-level correction overrides (user edits auto-extracted scanner values)
+        self._service_date_overrides: dict[int, str] = {}
+        self._provider_npi_overrides: dict[int, str] = {}
+        self._provider_name_overrides: dict[int, str] = {}
+        # User-assigned canonical provider name (never auto-filled from scanner)
+        self._provider_assigned: dict[int, str] = {}
+        # Ordered list of known provider names for autocomplete
+        self._provider_registry: list[str] = []
+        self._provider_registry_path = Path(manifest_csv).parent / ".dpp_providers.json"
+        self._load_provider_registry()
 
         self._load_manifest(manifest_csv)
         # Matched mode: pre-approve every page (already in consolidated; user marks removals)
@@ -1306,6 +1478,10 @@ class ReviewDialog(QDialog):
             "decision_sources": _to_stable(self._decision_sources),
             "dedup_group_ids": _to_stable(self._dedup_groups),
             "dedup_canonical_keys": dedup_canonical_keys,
+            "service_date_overrides": _to_stable(self._service_date_overrides),
+            "provider_npi_overrides": _to_stable(self._provider_npi_overrides),
+            "provider_name_overrides": _to_stable(self._provider_name_overrides),
+            "provider_assigned": _to_stable(self._provider_assigned),
         }
         tmp = self._draft_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(draft), encoding="utf-8")
@@ -1334,12 +1510,20 @@ class ReviewDialog(QDialog):
             sources_map: dict = raw.get("decision_sources", {})
             dedup_groups_map: dict = raw.get("dedup_group_ids", {})
             dedup_canonical_keys: list = raw.get("dedup_canonical_keys", [])
+            svc_date_map: dict = raw.get("service_date_overrides", {})
+            npi_map: dict = raw.get("provider_npi_overrides", {})
+            name_hint_map: dict = raw.get("provider_name_overrides", {})
+            assigned_map: dict = raw.get("provider_assigned", {})
         else:
             decisions_map = raw  # legacy flat
             triage_map = {}
             sources_map = {}
             dedup_groups_map = {}
             dedup_canonical_keys = []
+            svc_date_map = {}
+            npi_map = {}
+            name_hint_map = {}
+            assigned_map = {}
 
         # Build stable-key → index lookup for current row order
         key_to_idx: dict[str, int] = {}
@@ -1373,6 +1557,28 @@ class ReviewDialog(QDialog):
             key_to_idx[k] for k in dedup_canonical_keys if k in key_to_idx
         }
 
+        for key, val in svc_date_map.items():
+            idx = key_to_idx.get(key)
+            if idx is not None and val:
+                self._service_date_overrides[idx] = val
+
+        for key, val in npi_map.items():
+            idx = key_to_idx.get(key)
+            if idx is not None and val:
+                self._provider_npi_overrides[idx] = val
+
+        for key, val in name_hint_map.items():
+            idx = key_to_idx.get(key)
+            if idx is not None and val:
+                self._provider_name_overrides[idx] = val
+
+        for key, val in assigned_map.items():
+            idx = key_to_idx.get(key)
+            if idx is not None and val:
+                self._provider_assigned[idx] = val
+                if val not in self._provider_registry:
+                    self._provider_registry.append(val)
+
         if restored:
             self._refresh_list_colors()
             self._update_toolbar()
@@ -1387,6 +1593,123 @@ class ReviewDialog(QDialog):
                 ),
             )
 
+    def _load_provider_registry(self) -> None:
+        import json
+        try:
+            data = json.loads(self._provider_registry_path.read_text(encoding="utf-8"))
+            for name in data.get("provider_names", []):
+                if name and name not in self._provider_registry:
+                    self._provider_registry.append(name)
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+
+    def _save_provider_registry(self) -> None:
+        import json
+        try:
+            self._provider_registry_path.write_text(
+                json.dumps({"provider_names": self._provider_registry}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def _provider_key(self, row: dict, idx: int | None = None) -> str:
+        """Return the best available provider grouping key for a manifest row.
+
+        Resolution order (highest confidence first):
+          1. User-corrected NPI override
+          2. Auto-extracted NPI from scanner
+          3. User-assigned canonical provider name
+          4. User-corrected provider name hint
+          5. Auto-extracted provider name hint
+          6. Source PDF path (last resort)
+        """
+        if idx is not None:
+            npi = self._provider_npi_overrides.get(idx) or row.get("provider_npi", "")
+        else:
+            npi = row.get("provider_npi", "")
+        if npi:
+            return npi
+
+        if idx is not None:
+            assigned = self._provider_assigned.get(idx, "")
+            if assigned:
+                return assigned
+            name_hint = self._provider_name_overrides.get(idx) or row.get("provider_name_hint", "")
+        else:
+            name_hint = row.get("provider_name_hint", "")
+        if name_hint:
+            return name_hint
+
+        return row.get("source_pdf_path", "")
+
+    # ------------------------------------------------------------------ undo / redo
+
+    def _snapshot(self) -> _ReviewSnapshot:
+        return _ReviewSnapshot(
+            decisions=dict(self._decisions),
+            decision_sources=dict(self._decision_sources),
+            triage_decisions=dict(self._triage_decisions),
+            service_date_overrides=dict(self._service_date_overrides),
+            provider_npi_overrides=dict(self._provider_npi_overrides),
+            provider_name_overrides=dict(self._provider_name_overrides),
+            provider_assigned=dict(self._provider_assigned),
+            dedup_groups=dict(self._dedup_groups),
+            dedup_canonical=set(self._dedup_canonical),
+            rows=list(self._rows),
+            subtypes=list(self._subtypes),
+        )
+
+    def _push_undo(self) -> None:
+        self._undo_stack.append(self._snapshot())
+        if len(self._undo_stack) > _MAX_UNDO_DEPTH:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+        self._update_undo_redo_buttons()
+
+    def _apply_snapshot(self, snap: _ReviewSnapshot) -> None:
+        self._decisions = dict(snap.decisions)
+        self._decision_sources = dict(snap.decision_sources)
+        self._triage_decisions = dict(snap.triage_decisions)
+        self._service_date_overrides = dict(snap.service_date_overrides)
+        self._provider_npi_overrides = dict(snap.provider_npi_overrides)
+        self._provider_name_overrides = dict(snap.provider_name_overrides)
+        self._provider_assigned = dict(snap.provider_assigned)
+        self._dedup_groups = dict(snap.dedup_groups)
+        self._dedup_canonical = set(snap.dedup_canonical)
+        self._rows = list(snap.rows)
+        self._subtypes = list(snap.subtypes)
+        # Rebuild the list widget (row order may have changed)
+        self._list.clear()
+        for i, row in enumerate(self._rows):
+            self._list.addItem(self._make_list_item(i, row))
+        self._refresh_list_colors()
+        self._update_toolbar()
+        self._update_undo_redo_buttons()
+        self._save_draft()
+        if 0 <= self._current_index < len(self._rows):
+            self._list.setCurrentRow(self._current_index)
+            self._update_metadata(self._current_index)
+
+    def _undo(self) -> None:
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(self._snapshot())
+        self._apply_snapshot(self._undo_stack.pop())
+
+    def _redo(self) -> None:
+        if not self._redo_stack:
+            return
+        self._undo_stack.append(self._snapshot())
+        if len(self._undo_stack) > _MAX_UNDO_DEPTH:
+            self._undo_stack.pop(0)
+        self._apply_snapshot(self._redo_stack.pop())
+
+    def _update_undo_redo_buttons(self) -> None:
+        if hasattr(self, "_undo_btn") and hasattr(self, "_redo_btn"):
+            self._undo_btn.setEnabled(bool(self._undo_stack))
+            self._redo_btn.setEnabled(bool(self._redo_stack))
+
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -1397,6 +1720,16 @@ class ReviewDialog(QDialog):
         self._progress_label = QLabel("0 approved / 0 rejected / 0 remaining")
         toolbar.addWidget(self._progress_label)
         toolbar.addStretch()
+        self._undo_btn = QPushButton("Undo")
+        self._undo_btn.setToolTip("Undo last action (Ctrl+Z)")
+        self._undo_btn.setEnabled(False)
+        self._undo_btn.clicked.connect(self._undo)
+        toolbar.addWidget(self._undo_btn)
+        self._redo_btn = QPushButton("Redo")
+        self._redo_btn.setToolTip("Redo last undone action (Ctrl+Shift+Z)")
+        self._redo_btn.setEnabled(False)
+        self._redo_btn.clicked.connect(self._redo)
+        toolbar.addWidget(self._redo_btn)
         dedup_btn = QPushButton("Find Duplicates")
         dedup_btn.setToolTip(
             "Render all pages and detect visually similar groups using perceptual hashing. "
@@ -1412,6 +1745,14 @@ class ReviewDialog(QDialog):
         )
         triage_btn.clicked.connect(self._run_smart_triage)
         toolbar.addWidget(triage_btn)
+        therapy_triage_btn = QPushButton("Therapy Triage")
+        therapy_triage_btn.setToolTip(
+            "Per-provider therapy triage: approve intake/discharge pages; "
+            "fall back to first/last progress note; pre-reject the rest. "
+            "Groups by NPI when available, otherwise by source PDF."
+        )
+        therapy_triage_btn.clicked.connect(self._run_therapy_triage)
+        toolbar.addWidget(therapy_triage_btn)
         self._filter_btn = QPushButton("Approved + Duplicates")
         self._filter_btn.setCheckable(True)
         self._filter_btn.setToolTip(
@@ -1476,7 +1817,7 @@ class ReviewDialog(QDialog):
         self._meta_form = QFormLayout(meta_inner)
         self._meta_form.setSpacing(4)
         self._meta_labels: dict[str, QLabel] = {}
-        for field in (
+        for field_name in (
             "Source",
             "Page",
             "Type",
@@ -1489,8 +1830,40 @@ class ReviewDialog(QDialog):
         ):
             lbl = QLabel("—")
             lbl.setWordWrap(True)
-            self._meta_labels[field] = lbl
-            self._meta_form.addRow(f"{field}:", lbl)
+            self._meta_labels[field_name] = lbl
+            self._meta_form.addRow(f"{field_name}:", lbl)
+
+        # Editable correction / assignment fields
+        self._svc_date_edit = QLineEdit()
+        self._svc_date_edit.setPlaceholderText("YYYY-MM-DD")
+        self._svc_date_edit.setToolTip("Correct the auto-extracted service date")
+        self._svc_date_edit.editingFinished.connect(self._on_svc_date_edited)
+        self._meta_form.addRow("Service Date:", self._svc_date_edit)
+
+        self._provider_npi_edit = QLineEdit()
+        self._provider_npi_edit.setPlaceholderText("10-digit NPI")
+        self._provider_npi_edit.setToolTip("Correct the auto-extracted NPI")
+        self._provider_npi_edit.editingFinished.connect(self._on_provider_npi_edited)
+        self._meta_form.addRow("Provider NPI:", self._provider_npi_edit)
+
+        self._provider_hint_edit = QLineEdit()
+        self._provider_hint_edit.setPlaceholderText("auto-extracted hint")
+        self._provider_hint_edit.setToolTip("Correct the auto-extracted provider name hint")
+        self._provider_hint_edit.editingFinished.connect(self._on_provider_hint_edited)
+        self._meta_form.addRow("Name (auto):", self._provider_hint_edit)
+
+        self._name_model = QStringListModel(self._provider_registry, self)
+        self._name_completer = QCompleter(self._name_model, self)
+        self._name_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self._name_completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self._provider_name_combo = QComboBox()
+        self._provider_name_combo.setEditable(True)
+        self._provider_name_combo.setCompleter(self._name_completer)
+        self._provider_name_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._provider_name_combo.lineEdit().setPlaceholderText("Type or select provider…")
+        self._provider_name_combo.lineEdit().editingFinished.connect(self._on_provider_name_committed)
+        self._meta_form.addRow("Provider Name:", self._provider_name_combo)
+
         meta_scroll.setWidget(meta_inner)
         right_layout.addWidget(meta_scroll)
 
@@ -1522,6 +1895,9 @@ class ReviewDialog(QDialog):
         QShortcut(QKeySequence("D"), self).activated.connect(self._reject_duplicate)
         QShortcut(QKeySequence("R"), self).activated.connect(self._reject_irrelevant)
         QShortcut(QKeySequence("S"), self).activated.connect(self._skip)
+        QShortcut(QKeySequence("Ctrl+Z"), self).activated.connect(self._undo)
+        QShortcut(QKeySequence("Ctrl+Shift+Z"), self).activated.connect(self._redo)
+        QShortcut(QKeySequence("Ctrl+Y"), self).activated.connect(self._redo)
 
     # --------------------------------------------------------- navigation
 
@@ -1592,6 +1968,91 @@ class ReviewDialog(QDialog):
         self._meta_labels["Dates"].setText(
             row.get("dates_on_page", "—").replace("|", ", ") or "—"
         )
+        # Editable correction fields — show override if present, else auto-extracted value
+        svc = self._service_date_overrides.get(index) or row.get("service_date", "")
+        self._svc_date_edit.blockSignals(True)
+        self._svc_date_edit.setText(svc)
+        self._svc_date_edit.blockSignals(False)
+
+        npi = self._provider_npi_overrides.get(index) or row.get("provider_npi", "")
+        self._provider_npi_edit.blockSignals(True)
+        self._provider_npi_edit.setText(npi)
+        self._provider_npi_edit.blockSignals(False)
+
+        hint = self._provider_name_overrides.get(index) or row.get("provider_name_hint", "")
+        self._provider_hint_edit.blockSignals(True)
+        self._provider_hint_edit.setText(hint)
+        self._provider_hint_edit.blockSignals(False)
+
+        assigned = self._provider_assigned.get(index, "")
+        self._provider_name_combo.blockSignals(True)
+        le = self._provider_name_combo.lineEdit()
+        if le is not None:
+            le.setText(assigned)
+        self._provider_name_combo.blockSignals(False)
+
+    # ----------------------------------------- editable field handlers
+
+    def _on_svc_date_edited(self) -> None:
+        idx = self._current_index
+        if idx < 0:
+            return
+        val = self._svc_date_edit.text().strip()
+        if val == self._service_date_overrides.get(idx, ""):
+            return
+        self._push_undo()
+        if val:
+            self._service_date_overrides[idx] = val
+        else:
+            self._service_date_overrides.pop(idx, None)
+        self._save_draft()
+
+    def _on_provider_npi_edited(self) -> None:
+        idx = self._current_index
+        if idx < 0:
+            return
+        val = self._provider_npi_edit.text().strip()
+        if val == self._provider_npi_overrides.get(idx, ""):
+            return
+        self._push_undo()
+        if val:
+            self._provider_npi_overrides[idx] = val
+        else:
+            self._provider_npi_overrides.pop(idx, None)
+        self._save_draft()
+
+    def _on_provider_hint_edited(self) -> None:
+        idx = self._current_index
+        if idx < 0:
+            return
+        val = self._provider_hint_edit.text().strip()
+        if val == self._provider_name_overrides.get(idx, ""):
+            return
+        self._push_undo()
+        if val:
+            self._provider_name_overrides[idx] = val
+        else:
+            self._provider_name_overrides.pop(idx, None)
+        self._save_draft()
+
+    def _on_provider_name_committed(self) -> None:
+        idx = self._current_index
+        if idx < 0:
+            return
+        le = self._provider_name_combo.lineEdit()
+        val = le.text().strip() if le is not None else ""
+        if val == self._provider_assigned.get(idx, ""):
+            return
+        self._push_undo()
+        if val:
+            self._provider_assigned[idx] = val
+            if val not in self._provider_registry:
+                self._provider_registry.append(val)
+                self._name_model.setStringList(self._provider_registry)
+                self._save_provider_registry()
+        else:
+            self._provider_assigned.pop(idx, None)
+        self._save_draft()
 
     # --------------------------------------------------- triage helpers
 
@@ -1645,6 +2106,209 @@ class ReviewDialog(QDialog):
             return "billing"
         return None
 
+    def _detect_therapy_duplicates(self) -> set[int]:
+        """Return row indices that are likely therapy-record duplicates.
+
+        Groups rows by (provider_key, frozenset(dates_on_page)).  Within groups
+        with >1 row the highest-scoring row is kept; the rest are candidate
+        duplicates.  For rows without dates, groups by (provider_key,
+        frozenset(keywords_hit)) instead.
+        """
+        from collections import defaultdict
+
+        groups: dict[tuple, list[int]] = defaultdict(list)
+        for idx, row in enumerate(self._rows):
+            pk = self._provider_key(row, idx)
+            dates = frozenset(d for d in row.get("dates_on_page", "").split("|") if d)
+            if dates:
+                key: tuple = (pk, dates)
+            else:
+                kws = frozenset(k for k in row.get("keywords_hit", "").split("|") if k)
+                key = (pk, kws)
+            groups[key].append(idx)
+
+        duplicates: set[int] = set()
+        for indices in groups.values():
+            if len(indices) < 2:
+                continue
+            best = max(indices, key=lambda i: float(self._rows[i].get("total_hits", 0)))
+            duplicates.update(i for i in indices if i != best)
+        return duplicates
+
+    def _run_therapy_triage(self) -> None:
+        """Per-provider therapy triage.
+
+        Groups therapy pages by provider key (NPI > assigned name > name hint >
+        source PDF).  For each provider: approves intake/discharge pages; falls
+        back to first/last progress note when neither exists; pre-rejects the
+        remaining progress notes.  Re-sorts the list so intake/discharge appear
+        at the top.  All pre-selections are tagged 'smart_triage' so the user
+        can override any of them with A/D/R/S.
+        """
+        self._push_undo()
+        from collections import defaultdict
+
+        # Detect likely duplicates first
+        dup_candidates = self._detect_therapy_duplicates()
+        dup_count = 0
+        for idx in dup_candidates:
+            if idx not in self._decisions:
+                self._decisions[idx] = "rejected_duplicate"
+                self._decision_sources[idx] = "smart_triage"
+                dup_count += 1
+
+        # Group therapy rows by provider key
+        provider_items: dict[str, list[tuple[int, str | None]]] = defaultdict(list)
+        for idx, row in enumerate(self._rows):
+            sub = self._subtypes[idx] if idx < len(self._subtypes) else None
+            if sub in ("intake", "discharge", "progress"):
+                pk = self._provider_key(row, idx)
+                provider_items[pk].append((idx, sub))
+
+        providers_with_id: set[str] = set()
+        intake_discharge_count = 0
+        fallback_count = 0
+        prereject_count = 0
+        fallback_indices: set[int] = set()
+
+        for pk, items in provider_items.items():
+            has_id = any(sub in ("intake", "discharge") for _, sub in items)
+            if has_id:
+                providers_with_id.add(pk)
+                for idx, sub in items:
+                    if sub in ("intake", "discharge") and idx not in self._decisions:
+                        self._decisions[idx] = "approved"
+                        self._decision_sources[idx] = "smart_triage"
+                        intake_discharge_count += 1
+                continue
+
+            # Fallback: first/last progress note by service_date then dates_on_page
+            progress = [(idx, self._rows[idx]) for idx, sub in items if sub == "progress"]
+            if not progress:
+                continue
+
+            def _best_date(r: dict, i: int, want_min: bool) -> str:
+                svc = self._service_date_overrides.get(i) or r.get("service_date", "")
+                if svc:
+                    return svc
+                ds = [d for d in r.get("dates_on_page", "").split("|") if d]
+                if not ds:
+                    return "9999-99-99" if want_min else "0000-00-00"
+                return min(ds) if want_min else max(ds)
+
+            first_idx = min(progress, key=lambda t: _best_date(t[1], t[0], True))[0]
+            last_idx = max(progress, key=lambda t: _best_date(t[1], t[0], False))[0]
+            for idx in {first_idx, last_idx}:
+                if idx not in self._decisions:
+                    self._decisions[idx] = "approved"
+                    self._decision_sources[idx] = "smart_triage"
+                    fallback_indices.add(idx)
+                    fallback_count += 1
+
+            for idx, _ in progress:
+                if idx not in self._decisions:
+                    self._decisions[idx] = "rejected_irrelevant"
+                    self._decision_sources[idx] = "smart_triage"
+                    prereject_count += 1
+
+        # For providers that had intake/discharge, pre-reject remaining progress notes
+        for pk, items in provider_items.items():
+            if pk not in providers_with_id:
+                continue
+            for idx, sub in items:
+                if sub == "progress" and idx not in self._decisions:
+                    self._decisions[idx] = "rejected_irrelevant"
+                    self._decision_sources[idx] = "smart_triage"
+                    prereject_count += 1
+
+        # Re-sort: intake → discharge → fallback progress → other progress → rest → dups
+        def _triage_key(pair: tuple[int, dict]) -> tuple[int, str, str, float]:
+            i, r = pair
+            sub = self._subtypes[i] if i < len(self._subtypes) else None
+            is_dup = i in dup_candidates
+            if is_dup:
+                tier = 5
+            elif sub == "intake":
+                tier = 0
+            elif sub == "discharge":
+                tier = 1
+            elif i in fallback_indices:
+                tier = 2
+            elif sub == "progress":
+                tier = 3
+            elif sub is not None:
+                tier = 4
+            else:
+                tier = 4
+            pk = self._provider_key(r, i)
+            svc = self._service_date_overrides.get(i) or r.get("service_date", "")
+            return (tier, pk, svc, -float(r.get("total_hits", 0)))
+
+        # Remap decisions to stable keys before re-sorting
+        def _stable(d: dict[int, str]) -> dict[str, str]:
+            out: dict[str, str] = {}
+            for idx, val in d.items():
+                if idx < len(self._rows):
+                    row = self._rows[idx]
+                    key = f"{row.get('source_pdf_path', '')}|{row.get('page_num', '')}"
+                    out[key] = val
+            return out
+
+        stable_decisions = _stable(self._decisions)
+        stable_sources = _stable(self._decision_sources)
+        stable_triage = _stable(self._triage_decisions)
+        stable_svc = _stable(self._service_date_overrides)
+        stable_npi = _stable(self._provider_npi_overrides)
+        stable_hint = _stable(self._provider_name_overrides)
+        stable_assigned = _stable(self._provider_assigned)
+        stable_dedup_groups = _stable({k: str(v) for k, v in self._dedup_groups.items()})
+        stable_canonical = {
+            f"{self._rows[i].get('source_pdf_path', '')}|{self._rows[i].get('page_num', '')}"
+            for i in self._dedup_canonical if i < len(self._rows)
+        }
+
+        self._rows = sorted(enumerate(self._rows), key=_triage_key)  # type: ignore[assignment]
+        self._rows = [r for _, r in self._rows]  # type: ignore[misc]
+        self._subtypes = [self._classify_subtype(row) for row in self._rows]
+
+        # Restore all per-index state from stable keys
+        key_to_new: dict[str, int] = {}
+        for new_idx, row in enumerate(self._rows):
+            k = f"{row.get('source_pdf_path', '')}|{row.get('page_num', '')}"
+            key_to_new[k] = new_idx
+
+        def _restore(stable: dict[str, str]) -> dict[int, str]:
+            return {key_to_new[k]: v for k, v in stable.items() if k in key_to_new}
+
+        self._decisions = _restore(stable_decisions)
+        self._decision_sources = _restore(stable_sources)
+        self._triage_decisions = _restore(stable_triage)
+        self._service_date_overrides = _restore(stable_svc)
+        self._provider_npi_overrides = _restore(stable_npi)
+        self._provider_name_overrides = _restore(stable_hint)
+        self._provider_assigned = _restore(stable_assigned)
+        self._dedup_groups = {key_to_new[k]: int(v) for k, v in stable_dedup_groups.items() if k in key_to_new}  # type: ignore[arg-type]
+        self._dedup_canonical = {key_to_new[k] for k in stable_canonical if k in key_to_new}
+
+        # Rebuild list widget
+        self._list.clear()
+        for i, row in enumerate(self._rows):
+            self._list.addItem(self._make_list_item(i, row))
+        self._refresh_list_colors()
+        self._update_toolbar()
+        self._save_draft()
+
+        QMessageBox.information(
+            self,
+            "Therapy Triage Complete",
+            f"Triage complete:\n"
+            f"  • {intake_discharge_count} intake/discharge page(s) approved\n"
+            f"  • {fallback_count} first/last progress note(s) approved\n"
+            f"  • {prereject_count} remaining progress note(s) pre-rejected\n"
+            f"  • {dup_count} likely duplicate(s) pre-flagged\n\n"
+            "Review pre-selections and adjust as needed before exporting.",
+        )
+
     def _run_smart_triage(self) -> None:
         """Clinical auto-categorization pass (no duplicate detection — use Find Duplicates).
 
@@ -1653,6 +2317,7 @@ class ReviewDialog(QDialog):
         clinical pages. All suggestions are tagged source='smart_triage' so they
         appear in the distinct pale-blue / pale-lavender / pale-yellow color tier.
         """
+        self._push_undo()
         from collections import defaultdict
 
         src_items: dict[str, list[tuple[int, str | None]]] = defaultdict(list)
@@ -1859,10 +2524,27 @@ class ReviewDialog(QDialog):
         ]
         dialog_groups = [g for g in dialog_groups if len(g) >= 2]
 
+        # Render hi-res versions of only the flagged pages for the zoom popup.
+        group_indices = {idx for grp in groups for idx in grp}
+        hi_res: dict[int, QImage] = {}
+        self._progress_label.setText("Find Duplicates: rendering previews…")
+        QApplication.processEvents()
+        for idx in group_indices:
+            row = self._rows[idx]
+            try:
+                page_0idx = max(0, int(row.get("consolidated_page_num", "1")) - 1)
+                qimg_hi = self._pdf_doc.render(page_0idx, QSize(700, 910))
+                if not qimg_hi.isNull():
+                    hi_res[idx] = qimg_hi
+            except Exception:
+                pass
+        self._progress_label.setText(prev_label)
+
         dlg = _DedupDialog(
             dialog_groups,
             decisions=self._decisions,
             decision_sources=self._decision_sources,
+            hi_res=hi_res,
             parent=self,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -1871,6 +2553,7 @@ class ReviewDialog(QDialog):
 
         keep_indices, reject_indices = dlg.results()
         changed = 0
+        self._push_undo()
 
         for idx in reject_indices:
             self._decisions[idx] = "rejected_duplicate"
@@ -1949,6 +2632,7 @@ class ReviewDialog(QDialog):
     def _record_decision(self, decision: str) -> None:
         if self._current_index < 0:
             return
+        self._push_undo()
         was_decided = self._current_index in self._decisions
         self._decisions[self._current_index] = decision
         self._decision_sources[self._current_index] = "user"
@@ -2097,6 +2781,16 @@ class ReviewDialog(QDialog):
             else:
                 dedup_suggestion = "reject_duplicate"
 
+            # Effective provider/date values (override > auto-extracted)
+            auto_svc = row.get("service_date", "") or None
+            eff_svc = self._service_date_overrides.get(idx) or auto_svc
+            auto_npi = row.get("provider_npi", "") or None
+            eff_npi = self._provider_npi_overrides.get(idx) or auto_npi
+            auto_hint = row.get("provider_name_hint", "") or None
+            eff_hint = self._provider_name_overrides.get(idx) or auto_hint
+            eff_assigned = self._provider_assigned.get(idx) or None
+            eff_pk = self._provider_key(row, idx)
+
             rec = {
                 "schema_version": 1,
                 "label": label_str,
@@ -2130,14 +2824,98 @@ class ReviewDialog(QDialog):
                 "date_count": len(
                     [d for d in row.get("dates_on_page", "").split("|") if d]
                 ),
+                "service_date": eff_svc,
+                "provider_npi": eff_npi,
+                "provider_name_hint": eff_hint,
+                "provider_name": eff_assigned,
+                "provider_key": eff_pk,
                 "page_text": extract_page_text(src, pg)
                 or existing.get((src, pg), {}).get("page_text", ""),
             }
+            # Emit _predicted siblings only for fields the user actually corrected
+            if self._service_date_overrides.get(idx) and eff_svc != auto_svc:
+                rec["service_date_predicted"] = auto_svc
+            if self._provider_npi_overrides.get(idx) and eff_npi != auto_npi:
+                rec["provider_npi_predicted"] = auto_npi
+            if self._provider_name_overrides.get(idx) and eff_hint != auto_hint:
+                rec["provider_name_hint_predicted"] = auto_hint
+
             existing[(src, pg)] = rec
+
+        # Build provider summary from approved pages
+        from collections import Counter, defaultdict as _defaultdict
+        provider_pages: dict[str, list[dict]] = _defaultdict(list)
+        for (src, pg), rec in existing.items():
+            if rec.get("label") == "include":
+                pk = rec.get("provider_key") or src
+                provider_pages[pk].append(rec)
+
+        provider_date_ranges: dict[str, dict] = {}
+        for pk, recs in provider_pages.items():
+            all_dates: list[str] = []
+            for r in recs:
+                svc = r.get("service_date")
+                if svc:
+                    all_dates.append(svc)
+                else:
+                    all_dates.extend(r.get("dates_on_page") or [])
+            name_counter: Counter[str] = Counter(
+                r["provider_name"] for r in recs if r.get("provider_name")
+            )
+            provider_date_ranges[pk] = {
+                "provider_name": name_counter.most_common(1)[0][0] if name_counter else None,
+                "service_date_min": min(all_dates) if all_dates else None,
+                "service_date_max": max(all_dates) if all_dates else None,
+                "approved_page_count": len(recs),
+            }
+
+        summary_rec = {
+            "_type": "provider_summary",
+            "generated_at": now,
+            "provider_date_ranges": provider_date_ranges,
+        }
+
+        # Write corrections JSONL (one record per page where any field was corrected)
+        corrections_path = self._feedback_path.with_name(
+            self._feedback_path.stem + "_corrections.jsonl"
+        )
+        corrections: list[dict] = []
+        for idx, row in enumerate(self._rows):
+            if idx not in self._decisions:
+                continue
+            src = row.get("source_pdf_path", "")
+            pg = int(row.get("page_num", 0))
+            corr: dict = {}
+            if idx in self._service_date_overrides:
+                auto = row.get("service_date") or None
+                corrected = self._service_date_overrides[idx]
+                if corrected != auto:
+                    corr["service_date"] = {"auto": auto, "corrected": corrected}
+            if idx in self._provider_npi_overrides:
+                auto = row.get("provider_npi") or None
+                corrected = self._provider_npi_overrides[idx]
+                if corrected != auto:
+                    corr["provider_npi"] = {"auto": auto, "corrected": corrected}
+            if idx in self._provider_name_overrides:
+                auto = row.get("provider_name_hint") or None
+                corrected = self._provider_name_overrides[idx]
+                if corrected != auto:
+                    corr["provider_name_hint"] = {"auto": auto, "corrected": corrected}
+            if corr:
+                corrections.append({"source_pdf_path": src, "page_num": pg, "corrections": corr})
+
+        if corrections:
+            with open(corrections_path, "w", encoding="utf-8") as cf:
+                for c in corrections:
+                    cf.write(json.dumps(c) + "\n")
 
         with open(self._feedback_path, "w", encoding="utf-8") as f:
             for rec in existing.values():
                 f.write(json.dumps(rec) + "\n")
+            f.write(json.dumps(summary_rec) + "\n")
+
+        # Persist provider registry (survives draft deletion)
+        self._save_provider_registry()
 
         # Draft is superseded by the committed feedback file — clear it
         try:

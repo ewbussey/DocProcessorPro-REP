@@ -53,6 +53,25 @@ _DOB_CONTEXT_RE = re.compile(
 )
 _DOB_LOOKBEHIND = 60  # characters before the date match to scan
 
+# Dates of service: labels that, when followed within _DOS_LOOKAHEAD chars by a date,
+# identify the highest-confidence service date on the page.
+_DOS_CONTEXT_RE = re.compile(
+    r"\b(?:date\s+of\s+service|d\.?o\.?s\.?|service\s+date|session\s+date"
+    r"|visit\s+date|appointment\s+date|date\s*:)\b",
+    re.IGNORECASE,
+)
+_DOS_LOOKAHEAD = 80  # characters after the DOS label to search for a date
+
+# Provider identifier extraction
+_NPI_EXTRACT_RE = re.compile(r"\bNPI[:\s#]*(\d{10})\b", re.IGNORECASE)
+_PROVIDER_NAME_RE = re.compile(
+    r"(?:Provider|Therapist|Clinician|Counselor|Psychologist|Psychiatrist"
+    r"|Rendered\s+by|Treating\s+(?:provider|clinician)|Supervising\s+clinician)"
+    r"[:\s]+([A-Z][a-z]+(?:[\s,]+[A-Z][a-z]*\.?){1,4})"
+    r"(?:[,\s]+(?:LCSW|LMFT|LPC|MFT|PhD|PsyD|MD|DO|NP|PA|LPCC|LMHC))?",
+    re.IGNORECASE,
+)
+
 _DATE_RE = re.compile(
     r"\b(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})\b"
     r"|(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})\b"
@@ -111,6 +130,60 @@ def _extract_dates(text: str) -> list[datetime.date]:
         except (ValueError, KeyError):
             pass
     return sorted(found)
+
+
+def _extract_service_date(text: str) -> datetime.date | None:
+    """Return the highest-confidence service date from text.
+
+    Searches for a date immediately following a DOS/session-date label within
+    _DOS_LOOKAHEAD characters.  Falls back to the earliest non-DOB date on the
+    page if no label is found.  Returns None if the page has no dates at all.
+    """
+    for label_m in _DOS_CONTEXT_RE.finditer(text):
+        window = text[label_m.end() : label_m.end() + _DOS_LOOKAHEAD]
+        date_m = _DATE_RE.search(window)
+        if date_m:
+            g = date_m.groups()
+            try:
+                if g[0] is not None:
+                    mo, day, yr = int(g[0]), int(g[1]), int(g[2])
+                    if yr < 100:
+                        yr += 2000 if yr < 50 else 1900
+                elif g[3] is not None:
+                    yr, mo, day = int(g[3]), int(g[4]), int(g[5])
+                elif g[6] is not None:
+                    mo = _MONTH_MAP[g[6][:3].lower()]
+                    day, yr = int(g[7]), int(g[8])
+                else:
+                    day, yr = int(g[9]), int(g[11])
+                    mo = _MONTH_MAP[g[10][:3].lower()]
+                if 1900 <= yr <= 2099:
+                    return datetime.date(yr, mo, day)
+            except (ValueError, KeyError):
+                pass
+    # Fallback: earliest non-DOB date on the page
+    all_dates = _extract_dates(text)
+    return all_dates[0] if all_dates else None
+
+
+def _extract_provider_id(text: str) -> tuple[str | None, str | None]:
+    """Return (npi, name_hint) extracted from text.
+
+    npi is the first 10-digit NPI number found after an 'NPI' label.
+    name_hint is the first provider name captured after a structured label
+    (Provider:, Therapist:, Clinician:, etc.).  Either may be None.
+    """
+    npi: str | None = None
+    m = _NPI_EXTRACT_RE.search(text)
+    if m:
+        npi = m.group(1)
+
+    name_hint: str | None = None
+    n = _PROVIDER_NAME_RE.search(text)
+    if n:
+        name_hint = n.group(1).strip()
+
+    return npi, name_hint
 
 
 # External binary detection (Tesseract + Poppler)
@@ -318,9 +391,10 @@ class PageMatch:
     keywords_hit: list[str]
     extraction_method: str  # "pdfplumber" or "ocr"
     total_hits: float
-    dates_on_page: list[str] = field(
-        default_factory=list
-    )  # ISO dates found on this page
+    dates_on_page: list[str] = field(default_factory=list)  # ISO dates found on this page
+    service_date: str | None = None       # highest-confidence service date (ISO)
+    provider_npi: str | None = None       # extracted 10-digit NPI
+    provider_name_hint: str | None = None  # extracted provider name, unverified
 
 
 @dataclass
@@ -336,6 +410,9 @@ class PageExclusion:
     exclusion_reasons: list[str]  # subset of: "below_threshold", "no_anchor",
     #   "no_required_category", "blocked_pattern"
     min_hits_threshold: float  # threshold in effect at scan time
+    service_date: str | None = None
+    provider_npi: str | None = None
+    provider_name_hint: str | None = None
 
 
 @dataclass
@@ -958,6 +1035,7 @@ CATEGORY_DOCUMENT_TYPE = KeywordCategory(
         "first session",
         "first visit",
         "initial visit",
+        "evaluation and management",
         # Therapy subtype — discharge / termination
         "termination note",
         "termination summary",
@@ -970,6 +1048,7 @@ CATEGORY_DOCUMENT_TYPE = KeywordCategory(
         # Therapy subtype — progress notes
         "session note",
         "treatment note",
+        "SOAP note",
     ],
     patterns=[
         r"\b(?:discharge|admission|progress|consultation|attending|physician|operative|procedure|triage|intake|initial|termination)\s+(?:summary|note|report|history|evaluation)\b",
@@ -1182,6 +1261,9 @@ def scan_pdf(
         page_dates = _extract_dates(text)
         all_dates.update(page_dates)
         all_page_dates[i] = [d.isoformat() for d in page_dates]
+        svc_date = _extract_service_date(text)
+        page_service_date = svc_date.isoformat() if svc_date else None
+        page_npi, page_name_hint = _extract_provider_id(text)
 
         # Count keywords first (before blocklist) so blocked-but-scored pages
         # can be captured as reviewable exclusions.
@@ -1212,6 +1294,9 @@ def scan_pdf(
                         dates_on_page=all_page_dates[i],
                         exclusion_reasons=["blocked_pattern"],
                         min_hits_threshold=min_hits,
+                        service_date=page_service_date,
+                        provider_npi=page_npi,
+                        provider_name_hint=page_name_hint,
                     )
                 )
             continue
@@ -1235,6 +1320,9 @@ def scan_pdf(
                     extraction_method=method,
                     total_hits=round(weighted_score, 2),
                     dates_on_page=all_page_dates[i],
+                    service_date=page_service_date,
+                    provider_npi=page_npi,
+                    provider_name_hint=page_name_hint,
                 )
             )
             log.debug("Page %d matched: %s", i + 1, matched_categories)
@@ -1256,6 +1344,9 @@ def scan_pdf(
                     dates_on_page=all_page_dates[i],
                     exclusion_reasons=reasons,
                     min_hits_threshold=min_hits,
+                    service_date=page_service_date,
+                    provider_npi=page_npi,
+                    provider_name_hint=page_name_hint,
                 )
             )
 
@@ -1541,6 +1632,9 @@ def write_unmatched_manifest(
                 "min_hits_threshold",
                 "exclusion_reasons",
                 "dates_on_page",
+                "service_date",
+                "provider_npi",
+                "provider_name_hint",
             ]
         )
         for exc in sorted(exclusions, key=lambda x: x.page_num):
@@ -1555,6 +1649,9 @@ def write_unmatched_manifest(
                     exc.min_hits_threshold,
                     "|".join(exc.exclusion_reasons),
                     "|".join(exc.dates_on_page),
+                    exc.service_date or "",
+                    exc.provider_npi or "",
+                    exc.provider_name_hint or "",
                 ]
             )
 
@@ -1592,6 +1689,9 @@ def write_matched_manifest(
                 "min_hits_threshold",
                 "exclusion_reasons",
                 "dates_on_page",
+                "service_date",
+                "provider_npi",
+                "provider_name_hint",
             ]
         )
         for m in sorted(matches, key=lambda x: x.page_num):
@@ -1606,6 +1706,9 @@ def write_matched_manifest(
                     min_hits_threshold,
                     "",  # no exclusion_reasons for matched pages
                     "|".join(m.dates_on_page),
+                    m.service_date or "",
+                    m.provider_npi or "",
+                    m.provider_name_hint or "",
                 ]
             )
 
@@ -2001,6 +2104,35 @@ def consolidate_unmatched(
 
 # BATCH PROCESSOR
 
+# These suffixes are checked when deciding whether a safe_stem already has
+# output files in the target directory.
+_PER_PDF_SUFFIXES = (
+    "_matched.pdf",
+    "_manifest.csv",
+    "_matched_manifest.csv",
+    "_dates.csv",
+    "_unmatched.pdf",
+    "_unmatched_manifest.csv",
+)
+
+
+def _unique_stem(out_dir: Path, safe_stem: str) -> str:
+    """Return safe_stem if no output files exist for it; otherwise iterate.
+
+    Checks for the existence of any file whose name is
+    ``{safe_stem}{suffix}`` for each suffix in _PER_PDF_SUFFIXES.  If a
+    conflict is found, tries ``{safe_stem}_001``, ``_002``, … until a free
+    slot is found.
+    """
+    if not any((out_dir / f"{safe_stem}{s}").exists() for s in _PER_PDF_SUFFIXES):
+        return safe_stem
+    n = 1
+    while True:
+        candidate = f"{safe_stem}_{n:03d}"
+        if not any((out_dir / f"{candidate}{s}").exists() for s in _PER_PDF_SUFFIXES):
+            return candidate
+        n += 1
+
 
 def scan_directory(
     input_dir: str,
@@ -2052,6 +2184,9 @@ def scan_directory(
 
     results: dict[str, ScanResult] = {}
     _depo_lock = threading.Lock()
+    # Maps original safe_stem → actual output stem (may differ when files exist).
+    # Keys are unique per-thread (one PDF per worker), so no lock is needed.
+    _out_stems: dict[str, str] = {}
 
     def _scan_one(pdf_path: Path, safe_stem: str) -> tuple[str, ScanResult]:
         empty = ScanResult(
@@ -2087,16 +2222,25 @@ def scan_directory(
             log.exception("Failed to scan %s — skipping.", pdf_path.name)
             return safe_stem, empty
 
+        # Resolve a non-conflicting stem before writing any output files.
+        out_stem = _unique_stem(out_dir, safe_stem)
+        _out_stems[safe_stem] = out_stem
+        if out_stem != safe_stem:
+            log.info(
+                "%s: output files already exist for stem %r — writing as %r.",
+                pdf_path.name, safe_stem, out_stem,
+            )
+
         if result.matches:
             extract_matched_pages(
                 str(pdf_path),
                 result.matches,
-                str(out_dir / f"{safe_stem}_matched.pdf"),
+                str(out_dir / f"{out_stem}_matched.pdf"),
                 page_buffer=page_buffer,
             )
             write_manifest(
                 result.matches,
-                str(out_dir / f"{safe_stem}_manifest.csv"),
+                str(out_dir / f"{out_stem}_manifest.csv"),
                 source_date_first=result.source_date_first,
                 source_date_last=result.source_date_last,
                 source_date_count=result.source_date_count,
@@ -2104,12 +2248,12 @@ def scan_directory(
             write_matched_manifest(
                 str(pdf_path),
                 result.matches,
-                str(out_dir / f"{safe_stem}_matched_manifest.csv"),
+                str(out_dir / f"{out_stem}_matched_manifest.csv"),
                 min_hits_threshold=min_hits,
             )
             write_dates_csv(
                 result.all_page_dates,
-                str(out_dir / f"{safe_stem}_dates.csv"),
+                str(out_dir / f"{out_stem}_dates.csv"),
             )
         else:
             log.info("%s: no matches.", pdf_path.name)
@@ -2118,12 +2262,12 @@ def scan_directory(
             extract_unmatched_pages(
                 str(pdf_path),
                 result.exclusions,
-                str(out_dir / f"{safe_stem}_unmatched.pdf"),
+                str(out_dir / f"{out_stem}_unmatched.pdf"),
             )
             write_unmatched_manifest(
                 str(pdf_path),
                 result.exclusions,
-                str(out_dir / f"{safe_stem}_unmatched_manifest.csv"),
+                str(out_dir / f"{out_stem}_unmatched_manifest.csv"),
             )
 
         return safe_stem, result
@@ -2155,8 +2299,13 @@ def scan_directory(
 
     safe_stems = [s for _, s in items]
 
-    # Consolidate matched outputs
-    matched_stems = [s for s in safe_stems if results.get(s) and results[s].matches]
+    # Build consolidation lists using the actual output stems (which may differ
+    # from safe_stems when files from a previous run already existed).
+    matched_stems = [
+        _out_stems[s]
+        for s in safe_stems
+        if _out_stems.get(s) and results.get(s) and results[s].matches
+    ]
     if matched_stems:
         consolidated = consolidate_to_pdf(output_dir, matched_stems, progress_callback)
         consolidate_manifests(output_dir, matched_stems)
@@ -2167,7 +2316,9 @@ def scan_directory(
     # Consolidate unmatched outputs (independent — a PDF with zero matches can
     # still have scored-but-excluded pages)
     unmatched_stems = [
-        s for s in safe_stems if (out_dir / f"{s}_unmatched.pdf").exists()
+        _out_stems[s]
+        for s in safe_stems
+        if _out_stems.get(s) and (out_dir / f"{_out_stems[s]}_unmatched.pdf").exists()
     ]
     if unmatched_stems:
         consolidate_unmatched(output_dir, unmatched_stems, progress_callback)
