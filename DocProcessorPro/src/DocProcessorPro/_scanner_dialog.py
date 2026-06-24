@@ -50,6 +50,10 @@ class ScannerDialog(QDialog):
         self._update_checker: _UpdateChecker | None = None
         self._update_downloader: _UpdateDownloader | None = None
         self._settings = QSettings("DocProcessorPro", "KeywordScanner")
+        from . import _llm_client
+        _llm_client.configure(
+            str(self._settings.value("llm_service_url", _llm_client._DEFAULT_URL))
+        )
         self._saved_min_hits: float | None = None
         self._last_output_dir: "Path | None" = None
         self._last_scan_settings: "dict | None" = None
@@ -649,6 +653,20 @@ class _AppSettingsDialog(QDialog):
         row.addWidget(browse_btn)
         form.addRow("Output root:", row)
 
+        from . import _llm_client
+        self._llm_url_edit = QLineEdit(
+            str(self._settings.value("llm_service_url", _llm_client._DEFAULT_URL))
+        )
+        self._llm_url_edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._llm_url_edit.setToolTip(
+            "Base URL of the local LLM inference service.\n"
+            "Leave as default if running on the same machine (port 8765).\n"
+            "The service is optional — DocProcessorPro works without it."
+        )
+        form.addRow("LLM service URL:", self._llm_url_edit)
+
         root.addLayout(form)
 
         from PySide6.QtWidgets import QDialogButtonBox
@@ -670,6 +688,11 @@ class _AppSettingsDialog(QDialog):
         path = self._output_root_edit.text().strip()
         if path:
             self._settings.setValue("output_root", path)
+        llm_url = self._llm_url_edit.text().strip()
+        if llm_url:
+            self._settings.setValue("llm_service_url", llm_url)
+            from . import _llm_client
+            _llm_client.configure(llm_url)
         self.accept()
 
 

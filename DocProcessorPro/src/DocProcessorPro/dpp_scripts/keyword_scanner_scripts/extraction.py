@@ -118,17 +118,23 @@ def _extract_dates(text: str) -> list[datetime.date]:
     return sorted(found)
 
 
-def _extract_service_date(text: str) -> datetime.date | None:
-    """Return the highest-confidence service date from text.
+def _extract_service_date(text: str) -> tuple[datetime.date | None, str | None]:
+    """Return (service_date, raw_matched_str) from text.
 
     Searches for a date immediately following a DOS/session-date label within
     _DOS_LOOKAHEAD characters.  Falls back to the earliest non-DOB date on the
-    page if no label is found.  Returns None if the page has no dates at all.
+    page if no label is found.  Returns (None, None) if the page has no dates.
+
+    raw_matched_str is the literal string matched by the date regex (e.g.
+    "01/05/24", "Jan 5th, 2024") before ISO normalisation — preserved for
+    LLM fine-tuning and corrections tracking.  On the fallback path it is None
+    since there is no label-adjacent match to report.
     """
     for label_m in _DOS_CONTEXT_RE.finditer(text):
         window = text[label_m.end() : label_m.end() + _DOS_LOOKAHEAD]
         date_m = _DATE_RE.search(window)
         if date_m:
+            raw_str = date_m.group(0)
             g = date_m.groups()
             try:
                 if g[0] is not None:
@@ -144,20 +150,22 @@ def _extract_service_date(text: str) -> datetime.date | None:
                     day, yr = int(g[9]), int(g[11])
                     mo = _MONTH_MAP[g[10][:3].lower()]
                 if 1900 <= yr <= 2099:
-                    return datetime.date(yr, mo, day)
+                    return datetime.date(yr, mo, day), raw_str
             except (ValueError, KeyError):
                 pass
-    # Fallback: earliest non-DOB date on the page
+    # Fallback: earliest non-DOB date on the page (no label context to report)
     all_dates = _extract_dates(text)
-    return all_dates[0] if all_dates else None
+    return (all_dates[0], None) if all_dates else (None, None)
 
 
-def _extract_provider_id(text: str) -> tuple[str | None, str | None]:
-    """Return (npi, name_hint) extracted from text.
+def _extract_provider_id(text: str) -> tuple[str | None, str | None, str | None]:
+    """Return (npi, name_hint, name_context) extracted from text.
 
     npi is the first 10-digit NPI number found after an 'NPI' label.
     name_hint is the first provider name captured after a structured label
     (Provider:, Therapist:, Clinician:, etc.).  Either may be None.
+    name_context is a ~150-char text window surrounding the name match —
+    preserved for LLM fine-tuning.  None when no name match is found.
     """
     npi: str | None = None
     m = _NPI_EXTRACT_RE.search(text)
@@ -165,11 +173,13 @@ def _extract_provider_id(text: str) -> tuple[str | None, str | None]:
         npi = m.group(1)
 
     name_hint: str | None = None
+    name_context: str | None = None
     n = _PROVIDER_NAME_RE.search(text)
     if n:
         name_hint = n.group(1).strip()
+        name_context = text[max(0, n.start() - 30) : n.end() + 100].strip()
 
-    return npi, name_hint
+    return npi, name_hint, name_context
 
 
 # External binary detection (Tesseract + Poppler)
@@ -506,9 +516,9 @@ def scan_pdf(
         page_dates = _extract_dates(text)
         all_dates.update(page_dates)
         all_page_dates[i] = [d.isoformat() for d in page_dates]
-        svc_date = _extract_service_date(text)
+        svc_date, raw_svc_str = _extract_service_date(text)
         page_service_date = svc_date.isoformat() if svc_date else None
-        page_npi, page_name_hint = _extract_provider_id(text)
+        page_npi, page_name_hint, name_ctx = _extract_provider_id(text)
 
         # Count keywords first (before blocklist) so blocked-but-scored pages
         # can be captured as reviewable exclusions.
@@ -542,6 +552,8 @@ def scan_pdf(
                         service_date=page_service_date,
                         provider_npi=page_npi,
                         provider_name_hint=page_name_hint,
+                        raw_service_date_str=raw_svc_str,
+                        provider_name_context=name_ctx,
                     )
                 )
             continue
@@ -568,6 +580,8 @@ def scan_pdf(
                     service_date=page_service_date,
                     provider_npi=page_npi,
                     provider_name_hint=page_name_hint,
+                    raw_service_date_str=raw_svc_str,
+                    provider_name_context=name_ctx,
                 )
             )
             log.debug("Page %d matched: %s", i + 1, matched_categories)
@@ -592,6 +606,8 @@ def scan_pdf(
                     service_date=page_service_date,
                     provider_npi=page_npi,
                     provider_name_hint=page_name_hint,
+                    raw_service_date_str=raw_svc_str,
+                    provider_name_context=name_ctx,
                 )
             )
 
@@ -611,6 +627,7 @@ def scan_pdf(
         source_date_last=unique_dates[-1].isoformat() if unique_dates else None,
         source_date_count=len(unique_dates),
         all_page_dates=all_page_dates,
+        page_texts={i: pt for i, pt in enumerate(page_texts)},
     )
 
 

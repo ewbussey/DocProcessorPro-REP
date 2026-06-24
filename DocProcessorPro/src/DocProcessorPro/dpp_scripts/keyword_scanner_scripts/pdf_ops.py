@@ -231,8 +231,10 @@ def write_matched_manifest(
                 "exclusion_reasons",
                 "dates_on_page",
                 "service_date",
+                "raw_service_date_str",
                 "provider_npi",
                 "provider_name_hint",
+                "provider_name_context",
                 "scan_stream",
             ]
         )
@@ -249,8 +251,10 @@ def write_matched_manifest(
                     "",  # no exclusion_reasons for matched pages
                     "|".join(m.dates_on_page),
                     m.service_date or "",
+                    m.raw_service_date_str or "",
                     m.provider_npi or "",
                     m.provider_name_hint or "",
+                    m.provider_name_context or "",
                     scan_stream,
                 ]
             )
@@ -291,8 +295,10 @@ def write_unmatched_manifest(
                 "exclusion_reasons",
                 "dates_on_page",
                 "service_date",
+                "raw_service_date_str",
                 "provider_npi",
                 "provider_name_hint",
+                "provider_name_context",
                 "scan_stream",
             ]
         )
@@ -309,8 +315,10 @@ def write_unmatched_manifest(
                     "|".join(exc.exclusion_reasons),
                     "|".join(exc.dates_on_page),
                     exc.service_date or "",
+                    exc.raw_service_date_str or "",
                     exc.provider_npi or "",
                     exc.provider_name_hint or "",
+                    exc.provider_name_context or "",
                     scan_stream,
                 ]
             )
@@ -928,3 +936,53 @@ def consolidate_all_scored(
         )
 
     return pdf_dest, csv_dest
+
+
+def write_page_texts_sidecar(
+    out_path: "str | Path",
+    page_texts: "dict[int, tuple[str, str]]",
+    matches: "list[PageMatch]",
+    exclusions: "list[PageExclusion]",
+) -> None:
+    """Write a JSONL sidecar mapping each page to its extracted text and raw fields.
+
+    One JSON object per line, keyed by 1-indexed page_num.  Only pages with
+    non-empty text are written.  Downstream consumers (ReviewDialog, LLM service)
+    can load this file to retrieve page text without re-opening source PDFs.
+
+    Schema per line:
+        page_num            int  (1-indexed)
+        text                str
+        extraction_method   str  ("pdfplumber" or "ocr")
+        raw_service_date_str str | null
+        provider_name_context str | null
+    """
+    import json
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build a lookup from 0-indexed page_num → raw extraction fields
+    raw_lookup: dict[int, tuple[str | None, str | None]] = {}
+    for m in matches:
+        raw_lookup[m.page_num] = (m.raw_service_date_str, m.provider_name_context)
+    for e in exclusions:
+        if e.page_num not in raw_lookup:
+            raw_lookup[e.page_num] = (e.raw_service_date_str, e.provider_name_context)
+
+    with open(out, "w", encoding="utf-8") as f:
+        for page_0idx in sorted(page_texts):
+            text, method = page_texts[page_0idx]
+            if not text.strip():
+                continue
+            raw_date, name_ctx = raw_lookup.get(page_0idx, (None, None))
+            record = {
+                "page_num": page_0idx + 1,
+                "text": text,
+                "extraction_method": method,
+                "raw_service_date_str": raw_date,
+                "provider_name_context": name_ctx,
+            }
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    log.info("Page-texts sidecar written to %s.", out.name)

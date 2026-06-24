@@ -37,6 +37,7 @@ from .extraction import (
 from .pdf_ops import (
     extract_matched_pages, extract_unmatched_pages,
     write_manifest, write_dates_csv, write_matched_manifest, write_unmatched_manifest,
+    write_page_texts_sidecar,
     consolidate_records, consolidate_bills, consolidate_to_pdf,
     consolidate_manifests, consolidate_dates, consolidate_unmatched,
     consolidate_all_scored,
@@ -56,6 +57,7 @@ _PER_PDF_SUFFIXES = (
     "_dates.csv",
     "_unmatched.pdf",
     "_unmatched_manifest.csv",
+    "_page_texts.jsonl",
 )
 
 
@@ -279,6 +281,14 @@ def scan_directory(
                 final_unmatched,
                 str(out_dir / f"{out_stem}_unmatched_manifest.csv"),
                 scan_stream="unmatched",
+            )
+
+        if records_result.page_texts:
+            write_page_texts_sidecar(
+                out_dir / f"{out_stem}_page_texts.jsonl",
+                records_result.page_texts,
+                combined.matches,
+                combined.exclusions,
             )
 
         return safe_stem, combined

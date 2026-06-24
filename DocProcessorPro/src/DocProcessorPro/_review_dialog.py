@@ -1852,6 +1852,28 @@ class ReviewDialog(QDialog):
                 except (json.JSONDecodeError, ValueError):
                     pass
 
+        # Build a lazy-loaded sidecar index: source_pdf_path → {1-indexed page_num → record}
+        _sidecar_cache: dict[str, dict[int, dict]] = {}
+
+        def _sidecar_rec(src_path: str, page_1idx: int) -> "dict | None":
+            if src_path not in _sidecar_cache:
+                from pathlib import Path as _Path
+                stem = _Path(src_path).stem
+                sidecar_path = self._output_dir / f"{stem}_page_texts.jsonl"
+                page_map: dict[int, dict] = {}
+                if sidecar_path.exists():
+                    for _line in sidecar_path.read_text(encoding="utf-8").splitlines():
+                        _line = _line.strip()
+                        if not _line:
+                            continue
+                        try:
+                            _rec = json.loads(_line)
+                            page_map[int(_rec["page_num"])] = _rec
+                        except (json.JSONDecodeError, KeyError, ValueError):
+                            pass
+                _sidecar_cache[src_path] = page_map
+            return _sidecar_cache[src_path].get(page_1idx)
+
         # Merge current session decisions (overwrite prior decisions for same page)
         now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         for idx, decision in self._decisions.items():
@@ -1910,6 +1932,18 @@ class ReviewDialog(QDialog):
             eff_assigned = self._provider_assigned.get(idx) or None
             eff_pk = self._provider_key(row, idx)
 
+            # Page text: prefer sidecar (written during scan), fall back to on-demand re-extraction
+            _sr = _sidecar_rec(src, pg)
+            if _sr and _sr.get("text"):
+                _page_text: str = _sr["text"]
+                _page_text_source = "sidecar"
+            else:
+                _page_text = (
+                    extract_page_text(src, pg)
+                    or existing.get((src, pg), {}).get("page_text", "")
+                )
+                _page_text_source = "fresh_extraction" if _page_text else "unavailable"
+
             rec = {
                 "schema_version": 1,
                 "label": label_str,
@@ -1953,8 +1987,16 @@ class ReviewDialog(QDialog):
                 "provider_name_hint": eff_hint,
                 "provider_name": eff_assigned,
                 "provider_key": eff_pk,
-                "page_text": extract_page_text(src, pg)
-                or existing.get((src, pg), {}).get("page_text", ""),
+                "page_text": _page_text,
+                "page_text_source": _page_text_source,
+                "raw_service_date_str": (
+                    (_sr.get("raw_service_date_str") if _sr else None)
+                    or row.get("raw_service_date_str") or None
+                ),
+                "provider_name_context": (
+                    (_sr.get("provider_name_context") if _sr else None)
+                    or row.get("provider_name_context") or None
+                ),
             }
             # Category / stream fields
             from DocProcessorPro.dpp_scripts.keyword_scanner_scripts.keyword_scanner_codebase import (
@@ -2029,7 +2071,12 @@ class ReviewDialog(QDialog):
                 auto = row.get("service_date") or None
                 corrected = self._service_date_overrides[idx]
                 if corrected != auto:
-                    corr["service_date"] = {"auto": auto, "corrected": corrected}
+                    _csr = _sidecar_rec(src, pg)
+                    raw_date = (
+                        (_csr.get("raw_service_date_str") if _csr else None)
+                        or row.get("raw_service_date_str") or None
+                    )
+                    corr["service_date"] = {"raw": raw_date, "auto": auto, "corrected": corrected}
             if idx in self._provider_npi_overrides:
                 auto = row.get("provider_npi") or None
                 corrected = self._provider_npi_overrides[idx]
@@ -2039,7 +2086,12 @@ class ReviewDialog(QDialog):
                 auto = row.get("provider_name_hint") or None
                 corrected = self._provider_name_overrides[idx]
                 if corrected != auto:
-                    corr["provider_name_hint"] = {"auto": auto, "corrected": corrected}
+                    _csr = _sidecar_rec(src, pg)
+                    raw_ctx = (
+                        (_csr.get("provider_name_context") if _csr else None)
+                        or row.get("provider_name_context") or None
+                    )
+                    corr["provider_name_hint"] = {"raw_context": raw_ctx, "auto": auto, "corrected": corrected}
             if idx in self._category_overrides:
                 from DocProcessorPro.dpp_scripts.keyword_scanner_scripts.keyword_scanner_codebase import (
                     DEFAULT_CATEGORIES,
@@ -2049,9 +2101,23 @@ class ReviewDialog(QDialog):
                 auto_cat = highest_weight_category(row_cats, DEFAULT_CATEGORIES)
                 corrected_cat = self._category_overrides[idx]
                 if corrected_cat != auto_cat:
-                    corr["primary_category"] = {"auto": auto_cat, "corrected": corrected_cat}
+                    corr["primary_category"] = {
+                        "raw_categories": row_cats,
+                        "auto": auto_cat,
+                        "corrected": corrected_cat,
+                    }
             if corr:
-                corrections.append({"source_pdf_path": src, "page_num": pg, "corrections": corr})
+                _csr = _sidecar_rec(src, pg)
+                _ctext: str = (
+                    (_csr.get("text", "") if _csr else "")
+                    or existing.get((src, pg), {}).get("page_text", "")
+                )
+                corrections.append({
+                    "source_pdf_path": src,
+                    "page_num": pg,
+                    "page_text": _ctext[:1500],
+                    "corrections": corr,
+                })
 
         if corrections:
             with open(corrections_path, "w", encoding="utf-8") as cf:

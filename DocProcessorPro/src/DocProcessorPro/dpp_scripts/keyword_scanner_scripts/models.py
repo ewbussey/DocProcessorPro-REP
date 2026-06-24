@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-import datetime
 from dataclasses import dataclass, field
 
 import regex
@@ -60,6 +59,8 @@ class PageMatch:
     service_date: str | None = None       # highest-confidence service date (ISO)
     provider_npi: str | None = None       # extracted 10-digit NPI
     provider_name_hint: str | None = None  # extracted provider name, unverified
+    raw_service_date_str: str | None = None  # raw regex-matched date string before ISO parsing
+    provider_name_context: str | None = None  # ~150-char text window around provider name match
 
 
 @dataclass
@@ -78,6 +79,8 @@ class PageExclusion:
     service_date: str | None = None
     provider_npi: str | None = None
     provider_name_hint: str | None = None
+    raw_service_date_str: str | None = None  # raw regex-matched date string before ISO parsing
+    provider_name_context: str | None = None  # ~150-char text window around provider name match
 
 
 @dataclass
@@ -92,3 +95,5 @@ class ScanResult:
     all_page_dates: dict[
         int, list[str]
     ]  # 0-indexed page → ISO date strings (all pages)
+    page_texts: dict[int, tuple[str, str]] = field(default_factory=dict)
+    # 0-indexed page_num → (text, extraction_method)
