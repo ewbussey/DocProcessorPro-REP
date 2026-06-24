@@ -414,13 +414,15 @@ def _is_deposition(pdf_path: str) -> bool:
 
 
 def _next_deposition_path(out_dir: Path) -> Path:
-    """Return the next available _deposition[_N].pdf path (not thread-safe on its own)."""
-    candidate = out_dir / "_deposition.pdf"
+    """Return the next available path under out_dir/_depositions/ (not thread-safe on its own)."""
+    depo_dir = out_dir / "_depositions"
+    depo_dir.mkdir(exist_ok=True)
+    candidate = depo_dir / "_deposition.pdf"
     if not candidate.exists():
         return candidate
     i = 1
     while True:
-        candidate = out_dir / f"_deposition_{i}.pdf"
+        candidate = depo_dir / f"_deposition_{i}.pdf"
         if not candidate.exists():
             return candidate
         i += 1

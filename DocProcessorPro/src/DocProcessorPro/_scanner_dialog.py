@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from ._gui_utils import _apply_win_minmax, _apply_app_icon
-from ._workers import _ScanWorker, _UpdateChecker, _UpdateDownloader
+from ._workers import _LlmBatchWorker, _ScanWorker, _UpdateChecker, _UpdateDownloader
 from ._review_dialog import ReviewDialog
 
 # Matches "{LastName(s)}, {FirstName(s)} {CaseNumber}" folder names.
@@ -47,6 +47,7 @@ class ScannerDialog(QDialog):
         self.setMinimumWidth(620)
         self.resize(660, 560)
         self._worker: _ScanWorker | None = None
+        self._llm_worker: _LlmBatchWorker | None = None
         self._update_checker: _UpdateChecker | None = None
         self._update_downloader: _UpdateDownloader | None = None
         self._settings = QSettings("DocProcessorPro", "KeywordScanner")
@@ -372,11 +373,7 @@ class ScannerDialog(QDialog):
         self._settings.setValue("last_input_dir", self._input_edit.text().strip())
         self._settings.setValue("last_output_dir", out)
         self._last_output_dir = Path(out)
-        self._status_label.setText(
-            f"Done. Processed {pdf_count} PDF(s); {match_count} match(es), "
-            f"{exclusion_count} reviewable exclusion(s). "
-            f"Output saved to: {out}"
-        )
+
         if exclusion_count > 0:
             self._review_btn.setEnabled(True)
             self._review_btn.setText(
@@ -388,12 +385,48 @@ class ScannerDialog(QDialog):
                 f"Review Records Pages ({match_count} matched)"
             )
 
-        # Auto-open the combined review dialog when both matched and exclusion
-        # data are available.  Open Finder after the dialog closes so it isn't
-        # buried behind the modal window; fall through to open immediately if
-        # the combined review PDF is not present.
-        review_pdf = self._last_output_dir / "_consolidated_review.pdf"
-        review_csv = self._last_output_dir / "_consolidated_review_manifest.csv"
+        # If the LLM service is reachable, run the batch pass before opening the
+        # review dialog so pre-classifications are ready when the dialog loads.
+        from . import _llm_client
+        if _llm_client.is_available():
+            self._status_label.setText(
+                f"Scan done ({pdf_count} PDF(s), {match_count} match(es)). "
+                f"Running LLM analysis…"
+            )
+            self._llm_worker = _LlmBatchWorker(out)
+            self._llm_worker.progress.connect(self._status_label.setText)
+            self._llm_worker.finished.connect(self._on_llm_batch_finished)
+            self._llm_worker.error.connect(self._on_llm_batch_error)
+            self._llm_worker.start()
+        else:
+            self._status_label.setText(
+                f"Done. Processed {pdf_count} PDF(s); {match_count} match(es), "
+                f"{exclusion_count} reviewable exclusion(s). "
+                f"Output saved to: {out}"
+            )
+            self._open_combined_review()
+
+    def _on_llm_batch_finished(self, processed: int, _skipped: int) -> None:
+        out = str(self._last_output_dir) if self._last_output_dir else ""
+        self._status_label.setText(
+            f"LLM analysis complete — {processed} page(s) pre-classified. "
+            f"Output saved to: {out}"
+        )
+        self._open_combined_review()
+
+    def _on_llm_batch_error(self, msg: str) -> None:
+        out = str(self._last_output_dir) if self._last_output_dir else ""
+        self._status_label.setText(
+            f"LLM analysis unavailable ({msg}). Output saved to: {out}"
+        )
+        self._open_combined_review()
+
+    def _open_combined_review(self) -> None:
+        """Auto-open the combined review dialog when both PDF and CSV are present."""
+        if self._last_output_dir is None:
+            return
+        review_pdf = self._last_output_dir / "_review" / "_consolidated_review.pdf"
+        review_csv = self._last_output_dir / "_review" / "_consolidated_review_manifest.csv"
         if review_pdf.exists() and review_csv.exists():
             dlg = ReviewDialog(
                 review_pdf,
@@ -405,7 +438,7 @@ class ScannerDialog(QDialog):
             )
             dlg.exec()
 
-        QDesktopServices.openUrl(QUrl.fromLocalFile(out))
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._last_output_dir)))
 
     def _open_review_dialog(self) -> None:
         if self._last_output_dir is None:
@@ -413,8 +446,8 @@ class ScannerDialog(QDialog):
                 self, "No Scan Data", "Run a scan first to generate review data."
             )
             return
-        pdf_path = self._last_output_dir / "_consolidated_unmatched.pdf"
-        csv_path = self._last_output_dir / "_consolidated_unmatched_manifest.csv"
+        pdf_path = self._last_output_dir / "_unmatched" / "_consolidated_unmatched.pdf"
+        csv_path = self._last_output_dir / "_unmatched" / "_consolidated_unmatched_manifest.csv"
         if not pdf_path.exists():
             QMessageBox.warning(
                 self,
@@ -438,8 +471,8 @@ class ScannerDialog(QDialog):
                 self, "No Scan Data", "Run a scan first to generate review data."
             )
             return
-        pdf_path = self._last_output_dir / "_consolidated_records.pdf"
-        csv_path = self._last_output_dir / "_consolidated_records_manifest.csv"
+        pdf_path = self._last_output_dir / "_records" / "_consolidated_records.pdf"
+        csv_path = self._last_output_dir / "_records" / "_consolidated_records_manifest.csv"
         if not pdf_path.exists():
             QMessageBox.warning(
                 self,
@@ -477,33 +510,78 @@ class ScannerDialog(QDialog):
             self,
             "Select Any File in Scan Output Folder",
             start,
-            "Review files (*_consolidated_unmatched.pdf *_consolidated_records.pdf "
-            "*_consolidated_bills.pdf "
+            "Review files (*_consolidated_review.pdf *_consolidated_unmatched.pdf "
+            "*_consolidated_records.pdf *_consolidated_bills.pdf "
             "*_review_draft.json *_matched_review_draft.json *_feedback.jsonl);;"
             "All files (*)",
         )
         if not selected:
             return
-        output_dir = Path(selected).parent
+        selected_path = Path(selected)
+        # If the user navigated into a subfolder, resolve to the parent output dir.
+        _SUBDIR_NAMES = {"_feedback", "_sidecars", "_review", "_records", "_bills", "_unmatched", "_depositions"}
+        candidate_dir = selected_path.parent
+        if candidate_dir.name in _SUBDIR_NAMES:
+            candidate_dir = candidate_dir.parent
+        output_dir = candidate_dir
         self._last_browsed_dir = str(output_dir)
 
         # Auto-detect which review to open based on filename selected
-        selected_name = Path(selected).name
-        open_matched = selected_name in (
-            "_consolidated_records.pdf",
-            "_consolidated.pdf",          # legacy name
-            "_matched_review_draft.json",
-            "_matched_feedback.jsonl",
-        ) or selected_name.endswith("_records_manifest.csv") \
-          or selected_name.endswith("_matched_manifest.csv")
+        selected_name = selected_path.name
+        open_combined = selected_name in (
+            "_consolidated_review.pdf",
+            "_combined_review_draft.json",
+            "_combined_feedback.jsonl",
+        )
+        open_matched = not open_combined and (
+            selected_name in (
+                "_consolidated_records.pdf",
+                "_consolidated.pdf",          # legacy name
+                "_matched_review_draft.json",
+                "_matched_feedback.jsonl",
+            ) or selected_name.endswith("_records_manifest.csv")
+            or selected_name.endswith("_matched_manifest.csv")
+        )
 
-        if open_matched:
-            # Prefer the new _consolidated_records.pdf; fall back to legacy name
-            pdf_path = output_dir / "_consolidated_records.pdf"
+        if open_combined:
+            pdf_path = output_dir / "_review" / "_consolidated_review.pdf"
             if not pdf_path.exists():
-                pdf_path = output_dir / "_consolidated.pdf"
+                pdf_path = output_dir / "_consolidated_review.pdf"  # legacy flat
             csv_path = (
-                output_dir / "_consolidated_records_manifest.csv"
+                output_dir / "_review" / "_consolidated_review_manifest.csv"
+                if (output_dir / "_review" / "_consolidated_review_manifest.csv").exists()
+                else output_dir / "_consolidated_review_manifest.csv"
+            )
+            if not pdf_path.exists():
+                QMessageBox.warning(
+                    self,
+                    "No Review PDF Found",
+                    "No _consolidated_review.pdf found in the selected folder.",
+                )
+                return
+            settings_dlg = _ScanSettingsDialog(parent=self)
+            if settings_dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            dlg = ReviewDialog(
+                pdf_path,
+                csv_path,
+                output_dir,
+                scan_settings=settings_dlg.scan_settings,
+                mode="combined",
+                parent=self,
+            )
+        elif open_matched:
+            # Look in _records/ subdir first; fall back to root (legacy flat layout)
+            pdf_path = output_dir / "_records" / "_consolidated_records.pdf"
+            if not pdf_path.exists():
+                pdf_path = output_dir / "_consolidated_records.pdf"
+            if not pdf_path.exists():
+                pdf_path = output_dir / "_consolidated.pdf"  # oldest legacy name
+            records_dir = output_dir / "_records"
+            csv_path = (
+                records_dir / "_consolidated_records_manifest.csv"
+                if (records_dir / "_consolidated_records_manifest.csv").exists()
+                else output_dir / "_consolidated_records_manifest.csv"
                 if (output_dir / "_consolidated_records_manifest.csv").exists()
                 else output_dir / "_consolidated_matched_manifest.csv"
             )
@@ -534,8 +612,15 @@ class ScannerDialog(QDialog):
                 parent=self,
             )
         else:
-            pdf_path = output_dir / "_consolidated_unmatched.pdf"
-            csv_path = output_dir / "_consolidated_unmatched_manifest.csv"
+            # Look in _unmatched/ subdir first; fall back to root (legacy flat layout)
+            pdf_path = output_dir / "_unmatched" / "_consolidated_unmatched.pdf"
+            if not pdf_path.exists():
+                pdf_path = output_dir / "_consolidated_unmatched.pdf"
+            csv_path = (
+                output_dir / "_unmatched" / "_consolidated_unmatched_manifest.csv"
+                if (output_dir / "_unmatched" / "_consolidated_unmatched_manifest.csv").exists()
+                else output_dir / "_consolidated_unmatched_manifest.csv"
+            )
             if not pdf_path.exists():
                 QMessageBox.warning(
                     self,

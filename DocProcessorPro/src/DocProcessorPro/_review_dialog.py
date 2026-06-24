@@ -74,6 +74,10 @@ _DECISION_COLORS: dict[tuple[str, str], tuple[int, int, int]] = {
     ("approved", "scanner_bills"): (190, 240, 255),  # cyan/teal
     ("rejected_duplicate", "scanner_bills"): (255, 210, 140),
     ("rejected_irrelevant", "scanner_bills"): (255, 200, 200),
+    # LLM batch-pass pre-classifications (mint — distinct from smart_triage blue)
+    ("approved", "llm_triage"): (175, 240, 215),
+    ("rejected_duplicate", "llm_triage"): (255, 210, 140),
+    ("rejected_irrelevant", "llm_triage"): (255, 200, 200),
 }
 
 # Background color for scanner-excluded pages with no decision yet (combined mode)
@@ -94,6 +98,30 @@ _CATEGORY_NAMES: list[str] = [
 # Categories that route a page to the bills stream
 _BILLS_CATEGORIES: frozenset[str] = frozenset({"BILLING", "INJURY_LEGAL"})
 
+# LLM record types that warrant automatic approval at high confidence.
+# OCR pages are excluded — text quality is too uncertain for unattended approval.
+_LLM_AUTO_APPROVE_TYPES: frozenset[str] = frozenset(
+    {"bill", "imaging", "pharmacy", "legal_document"}
+)
+_LLM_MIN_CONFIDENCE: float = 0.85
+
+_THERAPY_CATS: frozenset[str] = frozenset({"THERAPY", "BEHAVIORAL_HEALTH"})
+
+_INTAKE_KW: frozenset[str] = frozenset({
+    "initial evaluation", "initial eval", "initial assessment",
+    "intake", "initial visit", "new patient", "evaluation and management",
+    "initial consultation", "initial treatment",
+})
+
+_DISCHARGE_KW: frozenset[str] = frozenset({
+    "discharge summary", "discharge note", "discharge planning",
+    "final visit", "final treatment", "discharge instructions",
+    "completion of treatment", "discharged",
+})
+
+_AUTO_APPROVE_CATS: frozenset[str] = frozenset({
+    "BILLING", "INJURY_LEGAL", "IMAGING", "MEDICAL_TREATMENT", "VOCATIONAL",
+})
 
 _MAX_UNDO_DEPTH = 50
 
@@ -155,15 +183,17 @@ class ReviewDialog(QDialog):
         self.setWindowState(Qt.WindowState.WindowMaximized)
 
         self._output_dir = _Path(output_dir)
+        _feedback_dir = self._output_dir / "_feedback"
+        _feedback_dir.mkdir(exist_ok=True)
         if mode == "matched":
-            self._feedback_path = self._output_dir / "_matched_feedback.jsonl"
-            self._draft_path = self._output_dir / "_matched_review_draft.json"
+            self._feedback_path = _feedback_dir / "_matched_feedback.jsonl"
+            self._draft_path = _feedback_dir / "_matched_review_draft.json"
         elif mode == "combined":
-            self._feedback_path = self._output_dir / "_combined_feedback.jsonl"
-            self._draft_path = self._output_dir / "_combined_review_draft.json"
+            self._feedback_path = _feedback_dir / "_combined_feedback.jsonl"
+            self._draft_path = _feedback_dir / "_combined_review_draft.json"
         else:
-            self._feedback_path = self._output_dir / "_feedback.jsonl"
-            self._draft_path = self._output_dir / "_review_draft.json"
+            self._feedback_path = _feedback_dir / "_feedback.jsonl"
+            self._draft_path = _feedback_dir / "_review_draft.json"
         self._fb_worker: _FeedbackWorker | None = None
         self._scan_settings: "dict | None" = scan_settings
         self._apply_result: "tuple[int, int] | None" = (
@@ -207,6 +237,8 @@ class ReviewDialog(QDialog):
         self._provider_registry_path = Path(manifest_csv).parent / ".dpp_providers.json"
         self._load_provider_registry()
 
+        self._llm_index: dict[str, dict[int, dict]] = {}  # stem → {page_num → llm_record}
+
         self._load_manifest(manifest_csv)
         # Matched mode: pre-approve every page (already in consolidated; user marks removals)
         if self._mode == "matched":
@@ -222,6 +254,10 @@ class ReviewDialog(QDialog):
                     source = "scanner_bills" if stream == "bills" else "scanner"
                     self._decisions[i] = "approved"
                     self._decision_sources[i] = source
+        # LLM batch-pass pre-classifications: auto-approve high-confidence routine
+        # record types on pages that don't already have a scanner decision.
+        # _load_existing_feedback() called below will override with any saved user work.
+        self._apply_llm_triage()
         self._build_ui()
         self._load_pdf(review_pdf)
         self._load_existing_feedback()
@@ -1076,6 +1112,57 @@ class ReviewDialog(QDialog):
             return None
         return self._list.item(list_row)
 
+    def _apply_llm_triage(self) -> None:
+        """Load _llm_fields.jsonl sidecars and auto-approve high-confidence routine pages.
+
+        Only affects pages that have no existing decision (i.e. scanner-excluded pages
+        in combined mode, or all pages in unmatched mode).  Pages already approved by
+        the scanner are left untouched.  _load_existing_feedback() called after this
+        will overwrite any LLM decision with prior user work.
+        """
+        import json as _json
+        from pathlib import Path as _Path
+
+        for i, row in enumerate(self._rows):
+            if i in self._decisions:
+                continue  # scanner already set a decision; don't interfere
+
+            src = row.get("source_pdf_path", "")
+            stem = _Path(src).stem
+            pg = int(row.get("page_num", 0))
+
+            # Load sidecar on first access for this stem
+            if stem not in self._llm_index:
+                sidecar = self._output_dir / "_sidecars" / f"{stem}_llm_fields.jsonl"
+                page_map: dict[int, dict] = {}
+                if sidecar.exists():
+                    for _line in sidecar.read_text(encoding="utf-8").splitlines():
+                        _line = _line.strip()
+                        if not _line:
+                            continue
+                        try:
+                            _rec = _json.loads(_line)
+                            page_map[int(_rec["page_num"])] = _rec
+                        except (KeyError, ValueError, _json.JSONDecodeError):
+                            pass
+                self._llm_index[stem] = page_map
+
+            llm = self._llm_index[stem].get(pg)
+            if llm is None:
+                continue
+
+            record_type = llm.get("record_type", "")
+            confidence = float(llm.get("confidence", 0.0))
+            extraction_method = row.get("extraction_method", "")
+
+            if (
+                record_type in _LLM_AUTO_APPROVE_TYPES
+                and confidence >= _LLM_MIN_CONFIDENCE
+                and extraction_method != "ocr"
+            ):
+                self._decisions[i] = "approved"
+                self._decision_sources[i] = "llm_triage"
+
     def _classify_subtype(self, row: dict) -> str | None:
         cats = {c for c in row.get("categories_matched", "").split("|") if c}
         if not cats:
@@ -1859,7 +1946,7 @@ class ReviewDialog(QDialog):
             if src_path not in _sidecar_cache:
                 from pathlib import Path as _Path
                 stem = _Path(src_path).stem
-                sidecar_path = self._output_dir / f"{stem}_page_texts.jsonl"
+                sidecar_path = self._output_dir / "_sidecars" / f"{stem}_page_texts.jsonl"
                 page_map: dict[int, dict] = {}
                 if sidecar_path.exists():
                     for _line in sidecar_path.read_text(encoding="utf-8").splitlines():
@@ -1996,6 +2083,14 @@ class ReviewDialog(QDialog):
                 "provider_name_context": (
                     (_sr.get("provider_name_context") if _sr else None)
                     or row.get("provider_name_context") or None
+                ),
+                "record_type": (
+                    self._llm_index.get(Path(src).stem, {}).get(pg, {}).get("record_type")
+                    or None
+                ),
+                "llm_confidence": (
+                    self._llm_index.get(Path(src).stem, {}).get(pg, {}).get("confidence")
+                    or None
                 ),
             }
             # Category / stream fields

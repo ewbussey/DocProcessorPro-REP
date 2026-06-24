@@ -57,24 +57,34 @@ _PER_PDF_SUFFIXES = (
     "_dates.csv",
     "_unmatched.pdf",
     "_unmatched_manifest.csv",
+)
+# Sidecar files live in output_dir/_sidecars/ — checked separately in _unique_stem().
+_SIDECAR_SUFFIXES = (
     "_page_texts.jsonl",
+    "_llm_fields.jsonl",
 )
 
 
 def _unique_stem(out_dir: Path, safe_stem: str) -> str:
     """Return safe_stem if no output files exist for it; otherwise iterate.
 
-    Checks for the existence of any file whose name is
-    ``{safe_stem}{suffix}`` for each suffix in _PER_PDF_SUFFIXES.  If a
-    conflict is found, tries ``{safe_stem}_001``, ``_002``, … until a free
-    slot is found.
+    Checks _PER_PDF_SUFFIXES in out_dir and _SIDECAR_SUFFIXES in
+    out_dir/_sidecars/.  If a conflict is found, tries ``{safe_stem}_001``,
+    ``_002``, … until a free slot is found.
     """
-    if not any((out_dir / f"{safe_stem}{s}").exists() for s in _PER_PDF_SUFFIXES):
+    sidecars_dir = out_dir / "_sidecars"
+
+    def _exists(stem: str) -> bool:
+        return any((out_dir / f"{stem}{s}").exists() for s in _PER_PDF_SUFFIXES) or any(
+            (sidecars_dir / f"{stem}{s}").exists() for s in _SIDECAR_SUFFIXES
+        )
+
+    if not _exists(safe_stem):
         return safe_stem
     n = 1
     while True:
         candidate = f"{safe_stem}_{n:03d}"
-        if not any((out_dir / f"{candidate}{s}").exists() for s in _PER_PDF_SUFFIXES):
+        if not _exists(candidate):
             return candidate
         n += 1
 
@@ -284,8 +294,10 @@ def scan_directory(
             )
 
         if records_result.page_texts:
+            sidecars_dir = out_dir / "_sidecars"
+            sidecars_dir.mkdir(exist_ok=True)
             write_page_texts_sidecar(
-                out_dir / f"{out_stem}_page_texts.jsonl",
+                sidecars_dir / f"{out_stem}_page_texts.jsonl",
                 records_result.page_texts,
                 combined.matches,
                 combined.exclusions,
@@ -419,10 +431,10 @@ def apply_feedback(
         log.info("apply_feedback: no approved pages to apply.")
         return 0, rejected_count, 0
 
-    # Append approved pages to _consolidated.pdf
-    consolidated = out / "_consolidated.pdf"
+    # Append approved pages to _records/_consolidated_records.pdf
+    consolidated = out / "_records" / "_consolidated_records.pdf"
     if not consolidated.exists():
-        raise FileNotFoundError(f"Consolidated PDF not found: {consolidated}")
+        raise FileNotFoundError(f"Consolidated records PDF not found: {consolidated}")
 
     if progress_callback:
         progress_callback("Applying approved pages to consolidated PDF…")
@@ -457,8 +469,8 @@ def apply_feedback(
     tmp.replace(consolidated)
     log.info("apply_feedback: appended %d approved page(s) to %s.", pages_approved, consolidated.name)
 
-    # Rebuild _consolidated_unmatched.pdf by removing approved pages
-    unmatched_manifest = out / "_consolidated_unmatched_manifest.csv"
+    # Rebuild _unmatched/_consolidated_unmatched.pdf by removing approved pages
+    unmatched_manifest = out / "_unmatched" / "_consolidated_unmatched_manifest.csv"
     if unmatched_manifest.exists() and pages_approved:
         if progress_callback:
             progress_callback("Rebuilding consolidated unmatched PDF…")
@@ -479,7 +491,7 @@ def apply_feedback(
         ]
 
         if len(remaining_rows) < len(all_rows):
-            unmatched_pdf_path = out / "_consolidated_unmatched.pdf"
+            unmatched_pdf_path = out / "_unmatched" / "_consolidated_unmatched.pdf"
             if not remaining_rows:
                 # Every unmatched page was approved — clear the unmatched files.
                 for old in (unmatched_pdf_path, unmatched_manifest):
@@ -610,7 +622,7 @@ def apply_combined_feedback(
     }
 
     # Read the combined review manifest to get all scored pages
-    review_manifest = out / "_consolidated_review_manifest.csv"
+    review_manifest = out / "_review" / "_consolidated_review_manifest.csv"
     if not review_manifest.exists():
         raise FileNotFoundError(
             f"Combined review manifest not found: {review_manifest}"
@@ -703,8 +715,9 @@ def apply_combined_feedback(
     if progress_callback:
         progress_callback("Rebuilding records PDF from approved pages…")
 
-    records_pdf = out / "_consolidated_records.pdf"
-    records_manifest = out / "_consolidated_records_manifest.csv"
+    (out / "_records").mkdir(exist_ok=True)
+    records_pdf = out / "_records" / "_consolidated_records.pdf"
+    records_manifest = out / "_records" / "_consolidated_records_manifest.csv"
     pages_records = _build_pdf_and_manifest(
         approved_records, records_pdf, records_manifest, ""
     )
@@ -716,8 +729,9 @@ def apply_combined_feedback(
     if progress_callback:
         progress_callback("Rebuilding bills PDF from approved pages…")
 
-    bills_pdf = out / "_consolidated_bills.pdf"
-    bills_manifest = out / "_consolidated_bills_manifest.csv"
+    (out / "_bills").mkdir(exist_ok=True)
+    bills_pdf = out / "_bills" / "_consolidated_bills.pdf"
+    bills_manifest = out / "_bills" / "_consolidated_bills_manifest.csv"
     pages_bills = _build_pdf_and_manifest(
         approved_bills, bills_pdf, bills_manifest, ""
     )
@@ -725,8 +739,9 @@ def apply_combined_feedback(
     if progress_callback:
         progress_callback("Rebuilding consolidated unmatched PDF…")
 
-    unmatched_pdf = out / "_consolidated_unmatched.pdf"
-    unmatched_manifest = out / "_consolidated_unmatched_manifest.csv"
+    (out / "_unmatched").mkdir(exist_ok=True)
+    unmatched_pdf = out / "_unmatched" / "_consolidated_unmatched.pdf"
+    unmatched_manifest = out / "_unmatched" / "_consolidated_unmatched_manifest.csv"
     pages_unapproved = _build_pdf_and_manifest(
         unapproved_rows, unmatched_pdf, unmatched_manifest, " [excluded]"
     )
@@ -745,17 +760,16 @@ def apply_matched_feedback(
     feedback_path: str,
     progress_callback: Callable[[str], None] | None = None,
 ) -> tuple[int, int, int]:
-    """Remove user-rejected pages from _consolidated.pdf and rebuild it.
+    """Remove user-rejected pages from _records/_consolidated_records.pdf and rebuild it.
 
     Reads _matched_feedback.jsonl for "exclude" decisions (duplicate or irrelevant),
-    then rebuilds _consolidated.pdf from source PDFs using _consolidated_matched_manifest.csv
-    as the page index, skipping excluded pages.  Pages appended by a prior apply_feedback()
-    call (those not in the matched manifest) are preserved verbatim.
+    then rebuilds _consolidated_records.pdf from source PDFs using
+    _records/_consolidated_records_manifest.csv as the page index, skipping
+    excluded pages.
 
     Args:
-        output_dir:    Directory containing _consolidated.pdf and
-                       _consolidated_matched_manifest.csv.
-        feedback_path: Path to _matched_feedback.jsonl.
+        output_dir:    Directory containing _records/_consolidated_records.pdf.
+        feedback_path: Path to _matched_feedback.jsonl (in _feedback/ subdir).
 
     Returns: (pages_kept, pages_removed, pages_skipped_missing_source)
     """
@@ -767,14 +781,14 @@ def apply_matched_feedback(
     if not fb.exists():
         raise FileNotFoundError(f"Matched feedback file not found: {fb}")
 
-    consolidated = out / "_consolidated.pdf"
+    consolidated = out / "_records" / "_consolidated_records.pdf"
     if not consolidated.exists():
-        raise FileNotFoundError(f"Consolidated PDF not found: {consolidated}")
+        raise FileNotFoundError(f"Consolidated records PDF not found: {consolidated}")
 
-    matched_manifest = out / "_consolidated_matched_manifest.csv"
+    matched_manifest = out / "_records" / "_consolidated_records_manifest.csv"
     if not matched_manifest.exists():
         raise FileNotFoundError(
-            f"Consolidated matched manifest not found: {matched_manifest}\n"
+            f"Consolidated records manifest not found: {matched_manifest}\n"
             "Re-run the scan to generate the manifest before using matched review."
         )
 

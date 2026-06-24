@@ -445,6 +445,7 @@ def _consolidate_stream(
     out_manifest_name: str,
     progress_label: str,
     run_ocr: bool = False,
+    out_subdir: str = "",
     progress_callback: Callable[[str], None] | None = None,
 ) -> Path | None:
     """Shared consolidation logic for a single scan stream (records or bills).
@@ -452,10 +453,14 @@ def _consolidate_stream(
     Reads ``{stem}{content_suffix}`` and ``{stem}{manifest_suffix}`` for each
     stem, builds a combined PDF with separator pages, annotates each manifest
     row with ``consolidated_page_num``, writes ``out_pdf_name`` and
-    ``out_manifest_name``, then deletes the per-stem source files.
-    Returns the output PDF path or None if nothing was written.
+    ``out_manifest_name`` (into ``out_subdir`` if given), then deletes the
+    per-stem source files.  Returns the output PDF path or None if nothing was
+    written.
     """
     out = Path(output_dir)
+    dest_dir = (out / out_subdir) if out_subdir else out
+    dest_dir.mkdir(exist_ok=True)
+
     writer = pypdf.PdfWriter()
     all_manifest_rows: list[dict] = []
     included = 0
@@ -495,7 +500,7 @@ def _consolidate_stream(
     if not included:
         return None
 
-    dest = out / out_pdf_name
+    dest = dest_dir / out_pdf_name
     with open(dest, "wb") as f:
         writer.write(f)
     log.info(
@@ -504,7 +509,7 @@ def _consolidate_stream(
     )
 
     if all_manifest_rows:
-        csv_dest = out / out_manifest_name
+        csv_dest = dest_dir / out_manifest_name
         fieldnames = list(all_manifest_rows[0].keys())
         with open(csv_dest, "w", newline="", encoding="utf-8") as f:
             csv_writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -529,7 +534,7 @@ def consolidate_records(
     pdf_stems: list[str],
     progress_callback: Callable[[str], None] | None = None,
 ) -> Path | None:
-    """Consolidate per-stem records PDFs into _consolidated_records.pdf."""
+    """Consolidate per-stem records PDFs into _records/_consolidated_records.pdf."""
     return _consolidate_stream(
         output_dir, pdf_stems,
         content_suffix="_records.pdf",
@@ -538,6 +543,7 @@ def consolidate_records(
         out_manifest_name="_consolidated_records_manifest.csv",
         progress_label="records",
         run_ocr=True,
+        out_subdir="_records",
         progress_callback=progress_callback,
     )
 
@@ -547,7 +553,7 @@ def consolidate_bills(
     pdf_stems: list[str],
     progress_callback: Callable[[str], None] | None = None,
 ) -> Path | None:
-    """Consolidate per-stem bills PDFs into _consolidated_bills.pdf."""
+    """Consolidate per-stem bills PDFs into _bills/_consolidated_bills.pdf."""
     return _consolidate_stream(
         output_dir, pdf_stems,
         content_suffix="_bills.pdf",
@@ -556,6 +562,7 @@ def consolidate_bills(
         out_manifest_name="_consolidated_bills_manifest.csv",
         progress_label="bills",
         run_ocr=False,
+        out_subdir="_bills",
         progress_callback=progress_callback,
     )
 
@@ -672,7 +679,9 @@ def consolidate_manifests(
     if not all_rows:
         return None
 
-    dest = out / "_consolidated_manifest.csv"
+    records_dir = out / "_records"
+    records_dir.mkdir(exist_ok=True)
+    dest = records_dir / "_consolidated_manifest.csv"
     fieldnames = list(all_rows[0].keys())
     with open(dest, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -717,7 +726,9 @@ def consolidate_dates(
     if not all_rows:
         return None
 
-    dest = out / "_consolidated_dates.csv"
+    records_dir = out / "_records"
+    records_dir.mkdir(exist_ok=True)
+    dest = records_dir / "_consolidated_dates.csv"
     fieldnames = list(all_rows[0].keys())
     with open(dest, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -801,8 +812,11 @@ def consolidate_unmatched(
     if not included:
         return None, None
 
+    unmatched_dir = out / "_unmatched"
+    unmatched_dir.mkdir(exist_ok=True)
+
     # Write consolidated PDF
-    pdf_dest = out / "_consolidated_unmatched.pdf"
+    pdf_dest = unmatched_dir / "_consolidated_unmatched.pdf"
     with open(pdf_dest, "wb") as f:
         writer.write(f)
     log.info(
@@ -814,7 +828,7 @@ def consolidate_unmatched(
     # Write consolidated manifest
     csv_dest: Path | None = None
     if all_manifest_rows:
-        csv_dest = out / "_consolidated_unmatched_manifest.csv"
+        csv_dest = unmatched_dir / "_consolidated_unmatched_manifest.csv"
         fieldnames = list(all_manifest_rows[0].keys())
         with open(csv_dest, "w", newline="", encoding="utf-8") as f:
             csv_writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -912,7 +926,10 @@ def consolidate_all_scored(
     if not included:
         return None, None
 
-    pdf_dest = out / "_consolidated_review.pdf"
+    review_dir = out / "_review"
+    review_dir.mkdir(exist_ok=True)
+
+    pdf_dest = review_dir / "_consolidated_review.pdf"
     with open(pdf_dest, "wb") as f:
         writer.write(f)
     log.info(
@@ -923,7 +940,7 @@ def consolidate_all_scored(
 
     csv_dest: Path | None = None
     if all_rows:
-        csv_dest = out / "_consolidated_review_manifest.csv"
+        csv_dest = review_dir / "_consolidated_review_manifest.csv"
         fieldnames = list(all_rows[0].keys())
         with open(csv_dest, "w", newline="", encoding="utf-8") as f:
             csv_writer = csv.DictWriter(f, fieldnames=fieldnames)

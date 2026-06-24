@@ -13,6 +13,11 @@ Expected service API (implemented separately, e.g. MLX-LM on Mac):
     POST /extract_service_date  {"text": str, "raw": str}  → {"date": str|null}
     POST /extract_provider      {"text": str}               → {"name": str|null, "npi": str|null}
     POST /classify_category     {"text": str, "categories": list[str]} → {"category": str|null}
+    POST /extract_page_fields   {"text": str, "extraction_method": str}
+                                → {record_type, confidence, location_name, provider_name,
+                                   record_title, dates_on_page, continues_from_previous,
+                                   continues_to_next, ...type-specific fields}
+                                   (see llm_extraction_schema.md for full contract)
 
 All text payloads are pre-truncated to 2000 characters before sending.
 """
@@ -120,3 +125,16 @@ def infer_category(page_text: str, candidates: list[str]) -> str | None:
     if category and category in candidates:
         return str(category)
     return None
+
+
+def extract_page_fields(page_text: str, extraction_method: str) -> dict | None:
+    """Single-pass batch extraction: record type + all type-specific fields.
+
+    Returns the full extraction dict (see llm_extraction_schema.md) or None if
+    the service is unavailable or the response is malformed.  The caller is
+    responsible for attaching page_num from the sidecar record.
+    """
+    return _post(
+        "extract_page_fields",
+        {"text": page_text[:_TEXT_LIMIT], "extraction_method": extraction_method},
+    )
