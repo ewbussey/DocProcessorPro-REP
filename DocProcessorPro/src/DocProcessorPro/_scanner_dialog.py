@@ -8,17 +8,20 @@ from PySide6.QtCore import QSettings, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
+    QButtonGroup,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
@@ -130,30 +133,50 @@ class ScannerDialog(QDialog):
         )
         form.addRow("Page buffer:", self._page_buffer_spin)
 
-        # Document type filter checkbox
-        self._doc_section_check = QCheckBox("Require document type match")
-        self._doc_section_check.setToolTip(
+        # Filter mode radio group
+        filter_box = QGroupBox("Filter mode")
+        filter_layout = QVBoxLayout(filter_box)
+        filter_layout.setSpacing(4)
+
+        self._filter_standard_radio = QRadioButton(
+            "Standard — include all pages above score threshold"
+        )
+        self._filter_standard_radio.setToolTip(
+            "No additional filtering beyond the minimum score. Use for exploratory "
+            "scans or when you want comprehensive coverage including billing and "
+            "administrative pages."
+        )
+
+        self._filter_anchor_radio = QRadioButton(
+            "Filter billing noise — exclude billing-only pages"
+        )
+        self._filter_anchor_radio.setToolTip(
+            "Exclude pages whose only keyword matches are billing terms. Pages with "
+            "any clinical content (therapy, imaging, treatment, legal, vocational) "
+            "pass through. Recommended for most scans."
+        )
+        self._filter_anchor_radio.setChecked(True)
+
+        self._filter_strict_radio = QRadioButton(
+            "Strict — require document-type header (fewest pages, highest precision)"
+        )
+        self._filter_strict_radio.setToolTip(
             "Only include pages that carry a recognizable clinical document-type label "
-            "(e.g. operative note, consultation note, H&P, admission note, psychotherapy "
-            "note, imaging report, medical-legal report). Pages that contain clinical "
-            "content but no explicit document-type header will be excluded, so leave "
-            "unchecked unless output is dominated by untitled pages."
+            "(e.g. operative note, consultation note, H&P, progress note, imaging "
+            "report, medical-legal report). Use when output is dominated by untitled "
+            "pages that lack formal headers."
         )
-        form.addRow("", self._doc_section_check)
 
-        # Clinical anchor filter checkbox
-        self._require_anchor_check = QCheckBox("Require clinical category match")
-        self._require_anchor_check.setToolTip(
-            "Only include pages that match at least one clinically specific category "
-            "(Therapy, Medical Treatment, Injury/Legal, Imaging, Behavioral Health, "
-            "Vocational, or Document Type). Pages that only matched Billing terms will "
-            "be excluded. Recommended when output contains too many administrative or "
-            "billing-only pages."
-        )
-        form.addRow("", self._require_anchor_check)
+        self._filter_mode_group = QButtonGroup(self)
+        self._filter_mode_group.addButton(self._filter_standard_radio, 0)
+        self._filter_mode_group.addButton(self._filter_anchor_radio, 1)
+        self._filter_mode_group.addButton(self._filter_strict_radio, 2)
 
-        self._doc_section_check.toggled.connect(self._on_clinical_filter_toggled)
-        self._require_anchor_check.toggled.connect(self._on_clinical_filter_toggled)
+        filter_layout.addWidget(self._filter_standard_radio)
+        filter_layout.addWidget(self._filter_anchor_radio)
+        filter_layout.addWidget(self._filter_strict_radio)
+
+        form.addRow(filter_box)
 
         root.addLayout(form)
 
@@ -213,9 +236,6 @@ class ScannerDialog(QDialog):
         )
 
     # FILTER TOGGLE SLOTS
-
-    def _on_clinical_filter_toggled(self) -> None:
-        pass  # reserved for future cross-filter exclusion logic
 
     # BROWSE SLOTS
 
@@ -331,26 +351,25 @@ class ScannerDialog(QDialog):
         self._run_btn.setEnabled(False)
         self._status_label.setText("Scanning… this may take a while for large batches.")
 
-        if self._doc_section_check.isChecked():
+        if self._filter_strict_radio.isChecked():
             require: frozenset[str] | None = frozenset({"DOCUMENT_TYPE"})
-        else:
-            require = None
-
-        # Derive a human-readable mode label for feedback tagging
-        if self._doc_section_check.isChecked() and self._require_anchor_check.isChecked():
+            _require_anchor = True
             _mode = "document_type_and_anchor"
-        elif self._doc_section_check.isChecked():
-            _mode = "document_type_filter"
-        elif self._require_anchor_check.isChecked():
+        elif self._filter_anchor_radio.isChecked():
+            require = None
+            _require_anchor = True
             _mode = "clinical_anchor"
         else:
+            require = None
+            _require_anchor = False
             _mode = "standard"
+
         self._last_scan_settings = {
             "scan_mode": _mode,
             "min_hits": self._min_hits_spin.value(),
             "page_buffer": self._page_buffer_spin.value(),
             "require_categories": sorted(require) if require else None,
-            "require_anchor": self._require_anchor_check.isChecked(),
+            "require_anchor": _require_anchor,
         }
 
         self._worker = _ScanWorker(
@@ -358,7 +377,8 @@ class ScannerDialog(QDialog):
             output_dir,
             self._min_hits_spin.value(),
             self._page_buffer_spin.value(),
-            require_anchor=self._require_anchor_check.isChecked(),
+            require_anchor=_require_anchor,
+            require_categories=require,
         )
         self._worker.progress.connect(self._status_label.setText)
         self._worker.finished.connect(self._on_finished)
@@ -793,8 +813,6 @@ class _ScanSettingsDialog(QDialog):
     _MODE_ITEMS: list[tuple[str, "str | None"]] = [
         ("Don't specify", None),
         ("Standard (full clinical scan)", "standard"),
-        ("Affidavits + Bills only", "affidavits_bills"),
-        ("Document type filter", "document_type_filter"),
         ("Clinical anchor required", "clinical_anchor"),
         ("Document type + clinical anchor", "document_type_and_anchor"),
     ]
@@ -857,14 +875,7 @@ class _ScanSettingsDialog(QDialog):
         root.addLayout(btn_row)
 
     def _on_mode_changed(self, index: int) -> None:
-        mode = self._MODE_ITEMS[index][1]
-        if mode == "affidavits_bills":
-            self._min_hits_spin.setValue(0.3)
-            self._min_hits_spin.setEnabled(False)
-        else:
-            self._min_hits_spin.setEnabled(True)
-            if self._min_hits_spin.value() == 0.3:
-                self._min_hits_spin.setValue(3.0)
+        pass
 
     def _on_ok(self) -> None:
         mode = self._MODE_ITEMS[self._mode_combo.currentIndex()][1]
@@ -873,8 +884,6 @@ class _ScanSettingsDialog(QDialog):
         else:
             _require: "dict[str, tuple[list[str] | None, bool]]" = {
                 "standard": (None, False),
-                "affidavits_bills": (["BILLING", "INJURY_LEGAL"], False),
-                "document_type_filter": (["DOCUMENT_TYPE"], False),
                 "clinical_anchor": (None, True),
                 "document_type_and_anchor": (["DOCUMENT_TYPE"], True),
             }

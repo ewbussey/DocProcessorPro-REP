@@ -739,7 +739,7 @@ class ReviewDialog(QDialog):
 
         # Left: page list
         self._list = QListWidget()
-        self._list.setMaximumWidth(240)
+        self._list.setMinimumWidth(160)
         self._list.currentRowChanged.connect(self._on_list_row_changed)
         self._populate_list()
         splitter.addWidget(self._list)
@@ -761,7 +761,7 @@ class ReviewDialog(QDialog):
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(8, 4, 4, 4)
         right_layout.setSpacing(6)
-        right_panel.setMaximumWidth(260)
+        right_panel.setMinimumWidth(220)
 
         meta_scroll = QScrollArea()
         meta_scroll.setWidgetResizable(True)
@@ -812,7 +812,7 @@ class ReviewDialog(QDialog):
         self._provider_hint_edit.setPlaceholderText("auto-extracted hint")
         self._provider_hint_edit.setToolTip("Correct the auto-extracted provider name hint")
         self._provider_hint_edit.editingFinished.connect(self._on_provider_hint_edited)
-        self._meta_form.addRow("Name (auto):", self._provider_hint_edit)
+        self._meta_form.addRow("Extracted Name:", self._provider_hint_edit)
 
         self._name_model = QStringListModel(self._provider_registry, self)
         self._name_completer = QCompleter(self._name_model, self)
@@ -849,7 +849,7 @@ class ReviewDialog(QDialog):
         right_layout.addLayout(btn_layout)
         splitter.addWidget(right_panel)
 
-        splitter.setSizes([200, 650, 250])
+        splitter.setSizes([200, 580, 320])
         root.addWidget(splitter)
 
         # Keyboard shortcuts
@@ -1739,6 +1739,8 @@ class ReviewDialog(QDialog):
             decisions=self._decisions,
             decision_sources=self._decision_sources,
             hi_res=hi_res,
+            service_date_overrides=self._service_date_overrides,
+            cache_path=self._output_dir / "_feedback" / "_dedup_cache.json",
             parent=self,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:

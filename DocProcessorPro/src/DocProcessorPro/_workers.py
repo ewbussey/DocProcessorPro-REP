@@ -21,6 +21,7 @@ class _ScanWorker(QThread):
         min_hits: float,
         page_buffer: int,
         require_anchor: bool = False,
+        require_categories: "frozenset[str] | None" = None,
     ) -> None:
         super().__init__()
         self._input_dir = input_dir
@@ -28,6 +29,7 @@ class _ScanWorker(QThread):
         self._min_hits = min_hits
         self._page_buffer = page_buffer
         self._require_anchor = require_anchor
+        self._require_categories = require_categories
 
     def run(self) -> None:
         try:
@@ -42,6 +44,7 @@ class _ScanWorker(QThread):
                 DEFAULT_CATEGORIES,
                 min_hits=self._min_hits,
                 page_buffer=self._page_buffer,
+                require_categories=self._require_categories,
                 require_anchor=self._require_anchor,
                 progress_callback=self.progress.emit,
             )
