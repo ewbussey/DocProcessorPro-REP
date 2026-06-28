@@ -53,7 +53,7 @@ class PageMatch:
     page_num: int  # 0-indexed internally; written 1-indexed to CSV
     categories: list[str]
     keywords_hit: list[str]
-    extraction_method: str  # "pdfplumber" or "ocr"
+    extraction_method: str  # "liteparse" or "liteparse_ocr"
     total_hits: float
     dates_on_page: list[str] = field(default_factory=list)  # ISO dates found on this page
     service_date: str | None = None       # highest-confidence service date (ISO)
@@ -70,7 +70,7 @@ class PageExclusion:
     page_num: int  # 0-indexed (matches PageMatch convention)
     categories: list[str]  # categories that did match (may be empty)
     keywords_hit: list[str]  # deduplicated matched keywords
-    extraction_method: str  # "pdfplumber" or "ocr"
+    extraction_method: str  # "liteparse" or "liteparse_ocr"
     total_hits: float  # weighted score (> 0.0)
     dates_on_page: list[str]  # ISO dates found on this page
     exclusion_reasons: list[str]  # subset of: "below_threshold", "no_anchor",

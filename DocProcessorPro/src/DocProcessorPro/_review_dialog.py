@@ -123,6 +123,25 @@ _AUTO_APPROVE_CATS: frozenset[str] = frozenset({
     "BILLING", "INJURY_LEGAL", "IMAGING", "MEDICAL_TREATMENT", "VOCATIONAL",
 })
 
+# Maps LLM record_type values to the canonical keyword category they override.
+# Empty string → fall through to keyword category (used for "other_nec").
+_RECORD_TYPE_TO_CATEGORY: dict[str, str] = {
+    "office_visit":       "MEDICAL_TREATMENT",
+    "therapy_non_psych":  "THERAPY",
+    "therapy_psych":      "BEHAVIORAL_HEALTH",
+    "inpatient_stay":     "MEDICAL_TREATMENT",
+    "imaging":            "IMAGING",
+    "bill":               "BILLING",
+    "billing_affidavit":  "BILLING",
+    "vocational":         "VOCATIONAL",
+    "legal_document":     "INJURY_LEGAL",
+    "pharmacy":           "BILLING",
+    "ime":                "INJURY_LEGAL",
+    "neuropsych_testing": "BEHAVIORAL_HEALTH",
+    "operative_report":   "MEDICAL_TREATMENT",
+    "other_nec":          "",
+}
+
 _MAX_UNDO_DEPTH = 50
 
 
@@ -288,7 +307,7 @@ class ReviewDialog(QDialog):
             rows,
             key=lambda r: (r.get("source_pdf_path", ""), int(r.get("page_num", 0))),
         )
-        self._subtypes = [self._classify_subtype(row) for row in self._rows]
+        self._subtypes = [self._classify_subtype(i, row) for i, row in enumerate(self._rows)]
 
     def _load_pdf(self, pdf_path: "Path") -> None:
         try:
@@ -557,6 +576,36 @@ class ReviewDialog(QDialog):
         # Legacy fallback: infer from categories_matched
         cats = {c for c in row.get("categories_matched", "").split("|") if c}
         return "bills" if cats and cats <= _BILLS_CATEGORIES else "records"
+
+    def _llm_record(self, idx: int) -> "dict | None":
+        """Return the LLM extraction record for row idx, or None if unavailable."""
+        from pathlib import Path as _Path
+        row = self._rows[idx]
+        stem = _Path(row.get("source_pdf_path", "")).stem
+        pg = int(row.get("page_num", 0))
+        return self._llm_index.get(stem, {}).get(pg)
+
+    def _effective_category(self, idx: int) -> str:
+        """Return the authoritative category for row idx.
+
+        Priority: manual user override → LLM record_type mapping → keyword category.
+        Falls back cleanly when LLM data is unavailable or record_type is unknown.
+        """
+        override = self._category_overrides.get(idx)
+        if override:
+            return override
+        llm = self._llm_record(idx)
+        if llm:
+            mapped = _RECORD_TYPE_TO_CATEGORY.get(llm.get("record_type", ""), "")
+            if mapped:
+                return mapped
+        row = self._rows[idx]
+        from DocProcessorPro.dpp_scripts.keyword_scanner_scripts.keyword_scanner_codebase import (
+            DEFAULT_CATEGORIES,
+            highest_weight_category,
+        )
+        cats = [c for c in row.get("categories_matched", "").split("|") if c]
+        return highest_weight_category(cats, DEFAULT_CATEGORIES) or ""
 
     def _on_category_changed(self, _combo_index: int) -> None:
         """Persist a user-selected category override and refresh the list item."""
@@ -940,14 +989,8 @@ class ReviewDialog(QDialog):
         self._meta_labels["Dates"].setText(
             row.get("dates_on_page", "—").replace("|", ", ") or "—"
         )
-        # Category combo — show override if present, else system highest-weight category
-        cats = [c for c in row.get("categories_matched", "").split("|") if c]
-        from DocProcessorPro.dpp_scripts.keyword_scanner_scripts.keyword_scanner_codebase import (
-            DEFAULT_CATEGORIES,
-            highest_weight_category,
-        )
-        system_cat = highest_weight_category(cats, DEFAULT_CATEGORIES) or ""
-        eff_cat = self._category_overrides.get(index) or system_cat
+        # Category combo — manual override > LLM record_type > keyword category
+        eff_cat = self._effective_category(index)
         self._category_combo.blockSignals(True)
         _cat_i = self._category_combo.findText(eff_cat)
         self._category_combo.setCurrentIndex(_cat_i if _cat_i >= 0 else 0)
@@ -1158,17 +1201,17 @@ class ReviewDialog(QDialog):
             if (
                 record_type in _LLM_AUTO_APPROVE_TYPES
                 and confidence >= _LLM_MIN_CONFIDENCE
-                and extraction_method != "ocr"
+                and extraction_method != "liteparse_ocr"
             ):
                 self._decisions[i] = "approved"
                 self._decision_sources[i] = "llm_triage"
 
-    def _classify_subtype(self, row: dict) -> str | None:
-        cats = {c for c in row.get("categories_matched", "").split("|") if c}
-        if not cats:
+    def _classify_subtype(self, idx: int, row: dict) -> str | None:
+        eff = self._effective_category(idx)
+        if not eff:
             return None
         # Therapy subtype takes priority — most granular classification
-        if cats & _THERAPY_CATS:
+        if eff in _THERAPY_CATS:
             kw = {k.lower() for k in row.get("keywords_hit", "").split("|") if k}
             if kw & _INTAKE_KW:
                 return "intake"
@@ -1176,15 +1219,15 @@ class ReviewDialog(QDialog):
                 return "discharge"
             return "progress"
         # Non-therapy clinical categories
-        if "IMAGING" in cats:
+        if eff == "IMAGING":
             return "imaging"
-        if "INJURY_LEGAL" in cats:
+        if eff == "INJURY_LEGAL":
             return "legal"
-        if "MEDICAL_TREATMENT" in cats:
+        if eff == "MEDICAL_TREATMENT":
             return "medical"
-        if "VOCATIONAL" in cats:
+        if eff == "VOCATIONAL":
             return "vocational"
-        if "BILLING" in cats:
+        if eff == "BILLING":
             return "billing"
         return None
 
@@ -1351,7 +1394,7 @@ class ReviewDialog(QDialog):
 
         self._rows = sorted(enumerate(self._rows), key=_triage_key)  # type: ignore[assignment]
         self._rows = [r for _, r in self._rows]  # type: ignore[misc]
-        self._subtypes = [self._classify_subtype(row) for row in self._rows]
+        self._subtypes = [self._classify_subtype(i, row) for i, row in enumerate(self._rows)]
 
         # Restore all per-index state from stable keys
         key_to_new: dict[str, int] = {}
@@ -1471,12 +1514,12 @@ class ReviewDialog(QDialog):
         for idx, row in enumerate(self._rows):
             if idx in self._decisions:
                 continue
-            cats = {c for c in row.get("categories_matched", "").split("|") if c}
-            if cats & _AUTO_APPROVE_CATS and not (cats & _THERAPY_CATS):
+            eff = self._effective_category(idx)
+            if eff in _AUTO_APPROVE_CATS and eff not in _THERAPY_CATS:
                 self._decisions[idx] = "approved"
                 self._decision_sources[idx] = "smart_triage"
                 for label, cat_key in _CAT_LABELS:
-                    if cat_key in cats:
+                    if cat_key == eff:
                         cat_approve_counts[label] = cat_approve_counts.get(label, 0) + 1
                         break
 

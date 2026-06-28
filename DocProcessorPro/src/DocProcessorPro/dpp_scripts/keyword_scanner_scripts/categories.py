@@ -314,12 +314,17 @@ CATEGORY_INJURY_LEGAL = KeywordCategory(
         # Evaluations / examinations
         "independent medical examination",
         "IME",
+        "defense medical examination",
+        "defense IME",
         "independent medical evaluation",
         "qualified medical evaluator",
+        "qualified medical examiner",
         "QME",
         "agreed medical evaluator",
+        "agreed medical examiner",
         "AME",
         "panel QME",
+        "panel physician",
         "FCE",
         "narrative report",
         # Legal process

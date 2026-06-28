@@ -10,16 +10,19 @@ locally hosted service on port 8765.  Change it via App Settings in the GUI.
 Expected service API (implemented separately, e.g. MLX-LM on Mac):
 
     GET  /health
+    POST /extract_page_fields   {"text": str, "extraction_method": str}
+                                → {"output": "record_type: ___ | date: ___ | provider: ___ | ..."}
+
+    The model returns a pipe-delimited string wrapped in a JSON envelope.
+    _parse_pipe_delimited() maps it to the internal field dict.
+
+    Deprecated endpoints (still wired, ignored if service does not support them):
     POST /extract_service_date  {"text": str, "raw": str}  → {"date": str|null}
     POST /extract_provider      {"text": str}               → {"name": str|null, "npi": str|null}
     POST /classify_category     {"text": str, "categories": list[str]} → {"category": str|null}
-    POST /extract_page_fields   {"text": str, "extraction_method": str}
-                                → {record_type, confidence, location_name, provider_name,
-                                   record_title, dates_on_page, continues_from_previous,
-                                   continues_to_next, ...type-specific fields}
-                                   (see llm_extraction_schema.md for full contract)
 
 All text payloads are pre-truncated to 2000 characters before sending.
+See llm_extraction_schema.md for the full pipe-delimited field reference.
 """
 
 from __future__ import annotations
@@ -127,14 +130,60 @@ def infer_category(page_text: str, candidates: list[str]) -> str | None:
     return None
 
 
-def extract_page_fields(page_text: str, extraction_method: str) -> dict | None:
-    """Single-pass batch extraction: record type + all type-specific fields.
+def _parse_pipe_delimited(raw: str) -> dict:
+    """Parse the model's pipe-delimited output into an internal field dict.
 
-    Returns the full extraction dict (see llm_extraction_schema.md) or None if
-    the service is unavailable or the response is malformed.  The caller is
-    responsible for attaching page_num from the sidecar record.
+    Expected format: "record_type: ___ | date: ___ | provider: ___ | ..."
+    Unknown keys are silently ignored so the parser is forward-compatible with
+    additional fields added to the model's training data.
     """
-    return _post(
+    result: dict = {}
+    for segment in raw.split(" | "):
+        if ": " not in segment:
+            continue
+        key, _, value = segment.partition(": ")
+        key = key.strip().lower()
+        value = value.strip()
+        if key == "record_type":
+            result["record_type"] = value or None
+        elif key == "date":
+            result["service_date"] = value or None
+        elif key == "provider":
+            result["provider_name"] = value or None
+        elif key == "location":
+            result["location_name"] = value or None
+        elif key == "title":
+            result["record_title"] = value or None
+        elif key == "continues_from":
+            result["continues_from_previous"] = value.lower() == "yes"
+        elif key == "continues_to":
+            result["continues_to_next"] = value.lower() == "yes"
+        elif key == "confidence":
+            try:
+                result["confidence"] = float(value)
+            except ValueError:
+                pass
+    return result
+
+
+def extract_page_fields(page_text: str, extraction_method: str) -> dict | None:
+    """Single-pass extraction: record type + universal fields via pipe-delimited model output.
+
+    The service wraps the model's raw output in a JSON envelope:
+        {"output": "record_type: ___ | date: ___ | provider: ___ | ..."}
+
+    Returns a parsed field dict (see llm_extraction_schema.md) or None if the
+    service is unavailable, the response is malformed, or output is empty.
+    The caller is responsible for attaching page_num from the sidecar record.
+    """
+    result = _post(
         "extract_page_fields",
         {"text": page_text[:_TEXT_LIMIT], "extraction_method": extraction_method},
     )
+    if not result:
+        return None
+    raw = result.get("output", "")
+    if not raw:
+        return None
+    parsed = _parse_pipe_delimited(raw)
+    return parsed or None

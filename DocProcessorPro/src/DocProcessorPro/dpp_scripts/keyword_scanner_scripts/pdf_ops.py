@@ -389,7 +389,7 @@ def _ocr_consolidated(
     Add a searchable text layer to dest in-place using ocrmypdf.
 
     Pages that already carry native text are skipped (skip_text=True) so
-    pdfplumber-extracted pages are left untouched; only image-only pages
+    LiteParse-extracted pages are left untouched; only image-only pages
     (scanned originals and separator pages) get an OCR overlay.
 
     Writes to a sibling .ocr.pdf temp file then atomically replaces dest so
@@ -970,7 +970,7 @@ def write_page_texts_sidecar(
     Schema per line:
         page_num            int  (1-indexed)
         text                str
-        extraction_method   str  ("pdfplumber" or "ocr")
+        extraction_method   str  ("liteparse" or "liteparse_ocr")
         raw_service_date_str str | null
         provider_name_context str | null
     """

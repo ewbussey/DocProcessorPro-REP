@@ -38,7 +38,7 @@ dependencies = [
     "PySide6_Essentials>=6.11.1",
     "shiboken6>=6.11.1",
     # PDF text extraction
-    "pdfplumber>=0.11.9",
+    "liteparse>=2.2.1",
     "pdfminer.six>=20251230",
     "pypdfium2>=5.7.0",
     # PDF reading / writing

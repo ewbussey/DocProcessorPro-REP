@@ -156,7 +156,7 @@ class _LlmBatchWorker(QThread):
                             total_skipped += 1
                             continue
                         result = _llm_client.extract_page_fields(
-                            text, page.get("extraction_method", "pdfplumber")
+                            text, page.get("extraction_method", "liteparse")
                         )
                         if result is None:
                             total_skipped += 1

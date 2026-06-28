@@ -10,8 +10,8 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import pdfplumber
 import pytesseract
+from liteparse import LiteParse
 from pdf2image import convert_from_path
 
 from .models import KeywordCategory, PageMatch, PageExclusion, ScanResult
@@ -182,7 +182,50 @@ def _extract_provider_id(text: str) -> tuple[str | None, str | None, str | None]
     return npi, name_hint, name_context
 
 
-# External binary detection (Tesseract + Poppler)
+# External binary detection (Tesseract + Poppler + tessdata)
+
+
+def _find_tessdata() -> str | None:
+    """Locate the Tesseract tessdata directory for LiteParse's OCR backend.
+
+    Resolution order:
+    0. PyInstaller bundle  (sys._MEIPASS/tesseract/tessdata/)
+    1. TESSDATA_PATH environment variable
+    2. Common installation directories (macOS via Homebrew/MacPorts, Linux, Windows)
+    Returns None if not found; LiteParse will attempt its own default.
+    """
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidate = Path(meipass) / "tesseract" / "tessdata"
+        if candidate.is_dir():
+            return str(candidate)
+
+    env = os.environ.get("TESSDATA_PATH", "")
+    if env and Path(env).is_dir():
+        return env
+
+    if sys.platform == "darwin":
+        for candidate in (
+            "/opt/homebrew/share/tessdata",   # Homebrew — Apple Silicon
+            "/usr/local/share/tessdata",       # Homebrew — Intel
+            "/opt/local/share/tessdata",       # MacPorts
+        ):
+            if Path(candidate).is_dir():
+                return candidate
+    elif sys.platform == "win32":
+        for candidate in (
+            r"C:\Program Files\Tesseract-OCR\tessdata",
+            r"C:\Program Files (x86)\Tesseract-OCR\tessdata",
+            r"C:\Supporting_Libraries\Tesseract-OCR\tessdata",
+        ):
+            if Path(candidate).is_dir():
+                return candidate
+    else:  # Linux / other
+        for candidate in ("/usr/share/tessdata", "/usr/local/share/tessdata"):
+            if Path(candidate).is_dir():
+                return candidate
+
+    return None
 
 
 def _find_tesseract() -> str | None:
@@ -325,6 +368,7 @@ def _find_poppler() -> str | None:
 
 _TESSERACT_EXE: str | None = _find_tesseract()
 _POPPLER_BIN: str | None = _find_poppler()
+_TESSDATA_DIR: str | None = _find_tessdata()
 
 if _TESSERACT_EXE:
     pytesseract.pytesseract.tesseract_cmd = _TESSERACT_EXE
@@ -398,9 +442,8 @@ def _is_deposition(pdf_path: str) -> bool:
     Requires either a strong deposition marker or two supporting signals.
     """
     try:
-        with pdfplumber.open(pdf_path) as pdf:
-            pages = pdf.pages[:_DEPO_CHECK_PAGES]
-            text = "\n".join((p.extract_text() or "") for p in pages)
+        result = LiteParse(ocr_enabled=False, max_pages=_DEPO_CHECK_PAGES, quiet=True).parse(pdf_path)
+        text = "\n".join(p.text or "" for p in result.pages)
     except Exception:
         return False
 
@@ -442,10 +485,10 @@ def scan_pdf(
     """
     Scan every page of a PDF for keyword matches and extract all dates.
 
-    Opens pdfplumber once for the whole document, then does a second pass
-    for any pages whose text content falls below _MIN_NATIVE_CHARS (OCR
-    fallback via Tesseract). Keyword matching and date extraction run after
-    both passes across all pages.
+    Uses LiteParse for native text extraction (single pass over the whole
+    document), then falls back to Tesseract OCR for any pages whose native
+    text yield falls below _MIN_NATIVE_CHARS. Keyword matching and date
+    extraction run after both passes across all pages.
 
     Returns: ScanResult with matched pages and per-document date summary.
     """
@@ -453,20 +496,20 @@ def scan_pdf(
     if not path.exists():
         raise FileNotFoundError(pdf_path)
 
-    # Pass 1: native extraction — single pdfplumber open for the whole file
+    # Pass 1: native extraction via LiteParse (no OCR — fast structural parse)
     page_texts: list[tuple[str, str]] = []  # (text, method) indexed by page_num
     ocr_needed: list[int] = []
 
-    with pdfplumber.open(pdf_path) as pdf:
-        page_count = len(pdf.pages)
-        log.info("Scanning %s (%d pages)...", path.name, page_count)
-        for i, page in enumerate(pdf.pages):
-            native = page.extract_text() or ""
-            if len(native.strip()) >= _MIN_NATIVE_CHARS:
-                page_texts.append((native, "pdfplumber"))
-            else:
-                page_texts.append((native, "pdfplumber"))  # placeholder
-                ocr_needed.append(i)
+    lp_result = LiteParse(ocr_enabled=False, quiet=True, output_format="text").parse(pdf_path)
+    page_count = lp_result.num_pages
+    log.info("Scanning %s (%d pages)...", path.name, page_count)
+    for i, page in enumerate(lp_result.pages):
+        native = page.text or ""
+        if len(native.strip()) >= _MIN_NATIVE_CHARS:
+            page_texts.append((native, "liteparse"))
+        else:
+            page_texts.append((native, "liteparse"))  # placeholder
+            ocr_needed.append(i)
 
     # Pass 2: OCR for pages with insufficient native text.
     # A bounded thread pool (≤4 workers) runs Poppler + Tesseract concurrently across
@@ -501,7 +544,7 @@ def scan_pdf(
                     )
                 try:
                     page_num, text = fut.result()
-                    page_texts[page_num] = (text, "ocr")
+                    page_texts[page_num] = (text, "liteparse_ocr")
                 except Exception as exc:
                     page_num = ocr_futures[fut]
                     log.warning(
@@ -636,7 +679,7 @@ def scan_pdf(
 def extract_page_text(pdf_path: str, page_num: int) -> str:
     """Extract the text of a single page from a PDF (1-indexed page_num).
 
-    Mirrors the two-pass strategy used by scan_pdf: native pdfplumber first,
+    Mirrors the two-pass strategy used by scan_pdf: native LiteParse first,
     then Tesseract OCR if the native yield is below _MIN_NATIVE_CHARS.
     Returns an empty string if the file is missing, the page is out of range,
     or extraction fails for any reason.
@@ -647,22 +690,22 @@ def extract_page_text(pdf_path: str, page_num: int) -> str:
             log.warning("extract_page_text: file not found: %s", pdf_path)
             return ""
 
-        zero_idx = page_num - 1
-        with pdfplumber.open(pdf_path) as pdf:
-            if zero_idx < 0 or zero_idx >= len(pdf.pages):
-                log.warning(
-                    "extract_page_text: page %d out of range for %s (%d pages).",
-                    page_num,
-                    path.name,
-                    len(pdf.pages),
-                )
-                return ""
-            native = pdf.pages[zero_idx].extract_text() or ""
+        lp_result = LiteParse(
+            ocr_enabled=False, quiet=True, output_format="text",
+            target_pages=str(page_num),
+        ).parse(pdf_path)
+        pages = lp_result.pages
+        if not pages:
+            log.warning(
+                "extract_page_text: page %d out of range for %s.", page_num, path.name
+            )
+            return ""
+        native = pages[0].text or ""
 
         if len(native.strip()) >= _MIN_NATIVE_CHARS:
             return native
 
-        # OCR fallback for image-heavy pages
+        # OCR fallback for image-heavy pages (Tesseract via pdf2image)
         try:
             images = convert_from_path(
                 pdf_path,
