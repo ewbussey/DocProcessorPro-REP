@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from ._gui_utils import _apply_win_minmax, _apply_app_icon
-from ._workers import _LlmBatchWorker, _ScanWorker, _UpdateChecker, _UpdateDownloader
+from ._workers import _ScanWorker, _UpdateChecker, _UpdateDownloader
 from ._review_dialog import ReviewDialog
 
 # Matches "{LastName(s)}, {FirstName(s)} {CaseNumber}" folder names.
@@ -50,13 +50,15 @@ class ScannerDialog(QDialog):
         self.setMinimumWidth(620)
         self.resize(660, 560)
         self._worker: _ScanWorker | None = None
-        self._llm_worker: _LlmBatchWorker | None = None
         self._update_checker: _UpdateChecker | None = None
         self._update_downloader: _UpdateDownloader | None = None
         self._settings = QSettings("DocProcessorPro", "KeywordScanner")
         from . import _llm_client
-        _llm_client.configure(
-            str(self._settings.value("llm_service_url", _llm_client._DEFAULT_URL))
+        _llm_client.configure_small(
+            str(self._settings.value("llm_service_url", _llm_client._DEFAULT_SMALL_URL))
+        )
+        _llm_client.configure_large(
+            str(self._settings.value("llm_large_service_url", _llm_client._DEFAULT_LARGE_URL))
         )
         self._saved_min_hits: float | None = None
         self._last_output_dir: "Path | None" = None
@@ -386,7 +388,7 @@ class ScannerDialog(QDialog):
         self._worker.start()
 
     def _on_finished(
-        self, pdf_count: int, match_count: int, exclusion_count: int
+        self, pdf_count: int, match_count: int, exclusion_count: int, llm_classified_count: int
     ) -> None:
         self._run_btn.setEnabled(True)
         out = self._output_edit.text().strip()
@@ -405,39 +407,18 @@ class ScannerDialog(QDialog):
                 f"Review Records Pages ({match_count} matched)"
             )
 
-        # If the LLM service is reachable, run the batch pass before opening the
-        # review dialog so pre-classifications are ready when the dialog loads.
-        from . import _llm_client
-        if _llm_client.is_available():
-            self._status_label.setText(
-                f"Scan done ({pdf_count} PDF(s), {match_count} match(es)). "
-                f"Running LLM analysis…"
-            )
-            self._llm_worker = _LlmBatchWorker(out)
-            self._llm_worker.progress.connect(self._status_label.setText)
-            self._llm_worker.finished.connect(self._on_llm_batch_finished)
-            self._llm_worker.error.connect(self._on_llm_batch_error)
-            self._llm_worker.start()
-        else:
-            self._status_label.setText(
-                f"Done. Processed {pdf_count} PDF(s); {match_count} match(es), "
-                f"{exclusion_count} reviewable exclusion(s). "
-                f"Output saved to: {out}"
-            )
-            self._open_combined_review()
-
-    def _on_llm_batch_finished(self, processed: int, _skipped: int) -> None:
-        out = str(self._last_output_dir) if self._last_output_dir else ""
-        self._status_label.setText(
-            f"LLM analysis complete — {processed} page(s) pre-classified. "
-            f"Output saved to: {out}"
+        # LLM classification (when the small-model service is available)
+        # already happened inline, page by page, during the scan itself —
+        # there's no separate post-scan pass to wait on anymore.
+        classification_note = (
+            f"{llm_classified_count} page(s) classified via LLM."
+            if llm_classified_count
+            else "Small-model service unavailable — keyword fallback used."
         )
-        self._open_combined_review()
-
-    def _on_llm_batch_error(self, msg: str) -> None:
-        out = str(self._last_output_dir) if self._last_output_dir else ""
         self._status_label.setText(
-            f"LLM analysis unavailable ({msg}). Output saved to: {out}"
+            f"Done. Processed {pdf_count} PDF(s); {match_count} match(es), "
+            f"{exclusion_count} reviewable exclusion(s). {classification_note} "
+            f"Output saved to: {out}"
         )
         self._open_combined_review()
 
@@ -760,17 +741,30 @@ class _AppSettingsDialog(QDialog):
 
         from . import _llm_client
         self._llm_url_edit = QLineEdit(
-            str(self._settings.value("llm_service_url", _llm_client._DEFAULT_URL))
+            str(self._settings.value("llm_service_url", _llm_client._DEFAULT_SMALL_URL))
         )
         self._llm_url_edit.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
         self._llm_url_edit.setToolTip(
-            "Base URL of the local LLM inference service.\n"
+            "Base URL of the small-model LLM service (page categorization + embedding).\n"
             "Leave as default if running on the same machine (port 8765).\n"
             "The service is optional — DocProcessorPro works without it."
         )
-        form.addRow("LLM service URL:", self._llm_url_edit)
+        form.addRow("Small-model LLM URL:", self._llm_url_edit)
+
+        self._llm_large_url_edit = QLineEdit(
+            str(self._settings.value("llm_large_service_url", _llm_client._DEFAULT_LARGE_URL))
+        )
+        self._llm_large_url_edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._llm_large_url_edit.setToolTip(
+            "Base URL of the large-model LLM service (Qwen3.6 case analysis + docx summary).\n"
+            "Leave as default if running on the same machine (port 8766).\n"
+            "The service is optional — case summary generation is unavailable without it."
+        )
+        form.addRow("Large-model LLM URL:", self._llm_large_url_edit)
 
         root.addLayout(form)
 
@@ -793,11 +787,15 @@ class _AppSettingsDialog(QDialog):
         path = self._output_root_edit.text().strip()
         if path:
             self._settings.setValue("output_root", path)
+        from . import _llm_client
         llm_url = self._llm_url_edit.text().strip()
         if llm_url:
             self._settings.setValue("llm_service_url", llm_url)
-            from . import _llm_client
-            _llm_client.configure(llm_url)
+            _llm_client.configure_small(llm_url)
+        llm_large_url = self._llm_large_url_edit.text().strip()
+        if llm_large_url:
+            self._settings.setValue("llm_large_service_url", llm_large_url)
+            _llm_client.configure_large(llm_large_url)
         self.accept()
 
 

@@ -63,6 +63,10 @@ dependencies = [
     "urllib3>=2.6.3",
     # Shared runtime transitive
     "typing_extensions>=4.15.0",
+    # Docx summary generation
+    "python-docx>=1.2.0",
+    # Embedding math — RAG ranking, provider clustering, continuation similarity
+    "numpy>=2.4.0",
 ]
 
 [project.optional-dependencies]
@@ -75,4 +79,14 @@ dev = [
     "setuptools>=81.0.0",
     "types-regex>=2026.5.9.20260518",
     "types-requests>=2.33.0.20250516",
+]
+
+# Only needed on the machine hosting the local MLX-LM model servers (Apple
+# Silicon). Not required to run the GUI client. Install with:
+#   pip install -e ".[llm-server]"
+llm-server = [
+    "mlx-lm>=0.28.0",
+    "fastapi>=0.121.0",
+    "uvicorn[standard]>=0.38.0",
+    "pydantic>=2.13.0",
 ]

@@ -659,6 +659,33 @@ CLINICAL_ANCHOR_CATEGORIES: frozenset[str] = frozenset({
 _BILLS_MIN_HITS: float = 0.3
 _BILLS_REQUIRE_CATEGORIES: frozenset[str] = frozenset({"BILLING", "INJURY_LEGAL"})
 
+# LLM record types that warrant automatic approval at high confidence in the
+# Review dialog. OCR pages are excluded there — text quality is too uncertain
+# for unattended approval.
+_LLM_AUTO_APPROVE_TYPES: frozenset[str] = frozenset(
+    {"bill", "imaging", "pharmacy", "legal_document"}
+)
+_LLM_MIN_CONFIDENCE: float = 0.85
+
+# Maps LLM record_type values to the canonical keyword category they override.
+# Empty string -> fall through to keyword category (used for "other_nec").
+_RECORD_TYPE_TO_CATEGORY: dict[str, str] = {
+    "office_visit":       "MEDICAL_TREATMENT",
+    "therapy_non_psych":  "THERAPY",
+    "therapy_psych":      "BEHAVIORAL_HEALTH",
+    "inpatient_stay":     "MEDICAL_TREATMENT",
+    "imaging":            "IMAGING",
+    "bill":               "BILLING",
+    "billing_affidavit":  "BILLING",
+    "vocational":         "VOCATIONAL",
+    "legal_document":     "INJURY_LEGAL",
+    "pharmacy":           "BILLING",
+    "ime":                "INJURY_LEGAL",
+    "neuropsych_testing": "BEHAVIORAL_HEALTH",
+    "operative_report":   "MEDICAL_TREATMENT",
+    "other_nec":          "",
+}
+
 
 def highest_weight_category(
     categories_matched: list[str],

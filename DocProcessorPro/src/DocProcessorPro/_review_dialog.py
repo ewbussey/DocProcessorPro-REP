@@ -51,7 +51,13 @@ from ._dedup import (
     _DEDUP_CONFIRM_MAX_DIFF,
     _pixel_mad,
 )
-from ._workers import _FeedbackWorker
+from ._workers import _CaseSummaryWorker, _FeedbackWorker
+from DocProcessorPro.dpp_scripts.keyword_scanner_scripts.categories import (
+    _BILLS_REQUIRE_CATEGORIES as _BILLS_CATEGORIES,
+    _LLM_AUTO_APPROVE_TYPES,
+    _LLM_MIN_CONFIDENCE,
+    _RECORD_TYPE_TO_CATEGORY,
+)
 
 _DECISION_COLORS: dict[tuple[str, str], tuple[int, int, int]] = {
     ("approved", "user"): (200, 255, 200),  # green
@@ -95,16 +101,6 @@ _CATEGORY_NAMES: list[str] = [
     "DOCUMENT_TYPE",
 ]
 
-# Categories that route a page to the bills stream
-_BILLS_CATEGORIES: frozenset[str] = frozenset({"BILLING", "INJURY_LEGAL"})
-
-# LLM record types that warrant automatic approval at high confidence.
-# OCR pages are excluded — text quality is too uncertain for unattended approval.
-_LLM_AUTO_APPROVE_TYPES: frozenset[str] = frozenset(
-    {"bill", "imaging", "pharmacy", "legal_document"}
-)
-_LLM_MIN_CONFIDENCE: float = 0.85
-
 _THERAPY_CATS: frozenset[str] = frozenset({"THERAPY", "BEHAVIORAL_HEALTH"})
 
 _INTAKE_KW: frozenset[str] = frozenset({
@@ -122,25 +118,6 @@ _DISCHARGE_KW: frozenset[str] = frozenset({
 _AUTO_APPROVE_CATS: frozenset[str] = frozenset({
     "BILLING", "INJURY_LEGAL", "IMAGING", "MEDICAL_TREATMENT", "VOCATIONAL",
 })
-
-# Maps LLM record_type values to the canonical keyword category they override.
-# Empty string → fall through to keyword category (used for "other_nec").
-_RECORD_TYPE_TO_CATEGORY: dict[str, str] = {
-    "office_visit":       "MEDICAL_TREATMENT",
-    "therapy_non_psych":  "THERAPY",
-    "therapy_psych":      "BEHAVIORAL_HEALTH",
-    "inpatient_stay":     "MEDICAL_TREATMENT",
-    "imaging":            "IMAGING",
-    "bill":               "BILLING",
-    "billing_affidavit":  "BILLING",
-    "vocational":         "VOCATIONAL",
-    "legal_document":     "INJURY_LEGAL",
-    "pharmacy":           "BILLING",
-    "ime":                "INJURY_LEGAL",
-    "neuropsych_testing": "BEHAVIORAL_HEALTH",
-    "operative_report":   "MEDICAL_TREATMENT",
-    "other_nec":          "",
-}
 
 _MAX_UNDO_DEPTH = 50
 
@@ -214,6 +191,7 @@ class ReviewDialog(QDialog):
             self._feedback_path = _feedback_dir / "_feedback.jsonl"
             self._draft_path = _feedback_dir / "_review_draft.json"
         self._fb_worker: _FeedbackWorker | None = None
+        self._summary_worker: _CaseSummaryWorker | None = None
         self._scan_settings: "dict | None" = scan_settings
         self._apply_result: "tuple[int, int] | None" = (
             None  # (approved, skipped) set on successful apply
@@ -761,6 +739,13 @@ class ReviewDialog(QDialog):
         export_btn.setToolTip("Write decisions to _feedback.jsonl in the output folder")
         export_btn.clicked.connect(self._export_feedback)
         toolbar.addWidget(export_btn)
+        self._summary_btn = QPushButton("Generate Case Summary (.docx)")
+        self._summary_btn.setToolTip(
+            "Assemble approved pages into records and generate a case summary "
+            "docx via the large-model (Qwen3.6) service."
+        )
+        self._summary_btn.clicked.connect(self._generate_case_summary)
+        toolbar.addWidget(self._summary_btn)
         if self._mode == "matched":
             self._apply_btn = QPushButton("Remove Rejected && Rebuild")
             self._apply_btn.setToolTip(
@@ -2285,6 +2270,53 @@ class ReviewDialog(QDialog):
             "Feedback Exported",
             f"Feedback written to:\n{self._feedback_path}",
         )
+
+    def _generate_case_summary(self) -> None:
+        """Assemble approved pages into records and generate a case summary docx.
+
+        Runs against the human-reviewed/approved page set (via the on-disk
+        _sidecars/, populated by scanning + the LLM batch pass), not raw scan
+        output — case summaries should reflect reviewed decisions.
+        """
+        approved_count = sum(1 for d in self._decisions.values() if d == "approved")
+        if approved_count == 0:
+            QMessageBox.warning(
+                self,
+                "No Approved Pages",
+                "Approve at least one page before generating a case summary.",
+            )
+            return
+
+        from . import _llm_client
+        if not _llm_client.is_available("large"):
+            QMessageBox.warning(
+                self,
+                "Large Model Unavailable",
+                "The large-model (Qwen3.6) service is not reachable.\n"
+                "Case summary generation requires it — check the URL in App Settings.",
+            )
+            return
+
+        case_label = self._output_dir.name or "Case"
+        self._summary_btn.setEnabled(False)
+        self._summary_worker = _CaseSummaryWorker(str(self._output_dir), case_label)
+        self._summary_worker.progress.connect(self._progress_label.setText)
+        self._summary_worker.finished.connect(self._on_summary_finished)
+        self._summary_worker.error.connect(self._on_summary_error)
+        self._summary_worker.start()
+
+    def _on_summary_finished(self, docx_path: str) -> None:
+        self._summary_btn.setEnabled(True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(docx_path))
+        QMessageBox.information(
+            self,
+            "Case Summary Generated",
+            f"Case summary written to:\n{docx_path}",
+        )
+
+    def _on_summary_error(self, message: str) -> None:
+        self._summary_btn.setEnabled(True)
+        QMessageBox.critical(self, "Case Summary Failed", message)
 
     def _apply_approved(self) -> None:
         if self._mode == "matched":

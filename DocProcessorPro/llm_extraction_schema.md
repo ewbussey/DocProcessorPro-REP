@@ -1,8 +1,30 @@
 # LLM Extraction Schema — Pipe-Delimited Output Format
 
-The Qwen3 8B model outputs a single pipe-delimited line per page. The DocProcessorPro
+DocProcessorPro talks to two independently-hosted local models, each with its own
+service URL configured in App Settings (see `_llm_client.py`):
+
+- **Small model** (default `http://localhost:8765`) — page categorization + embedding.
+  Outputs a single pipe-delimited line per page (documented below). This is the model
+  the rest of this document describes. It is the **primary** signal for PDF
+  splitting-by-relevancy-and-provider: `extraction.classify_page()` classifies every
+  non-blocklisted page inline during the scan (`keyword_scanner_codebase.scan_directory()`),
+  and `keyword_scanner_codebase._route_page()` routes a page to the records/bills/unmatched
+  stream by its `record_type` whenever the model's `confidence` clears
+  `categories._LLM_MIN_CONFIDENCE` (0.85). The weighted-keyword scanner (`categories.py`,
+  the `min_hits`/`require_categories`/`require_anchor` gates) is the **fallback** path —
+  used automatically whenever the service is unavailable or a page's classification isn't
+  confident enough — and reproduces the pre-LLM keyword-only behavior exactly.
+- **Large model** (default `http://localhost:8766`, Qwen3.6 27B 4-bit) — case-level
+  analysis and summary generation, consuming the *output* of the small model's page
+  classification plus `record_assembly.py`'s multi-page grouping. See "Large-Model
+  Endpoint" below.
+
+A runnable scaffold for both (mock mode + real MLX-LM loading) lives in `llm_server/`
+at the repo root — see `llm_server/README.md` for how to run them.
+
+The small model outputs a single pipe-delimited line per page. The DocProcessorPro
 client wraps this in a JSON envelope and `_parse_pipe_delimited()` in `_llm_client.py`
-maps each field to the internal dict consumed by `_LlmBatchWorker` and `ReviewDialog`.
+maps each field to the internal dict consumed inline during scanning and by `ReviewDialog`.
 
 ---
 
@@ -72,26 +94,105 @@ for all LLM-processed pages.
 
 ## Multi-Page Record Assembly (Downstream Python)
 
-The batch pass produces one extraction record per page. Multi-page records are
-assembled by downstream Python using the continuation flags:
+**Implemented** in `dpp_scripts/keyword_scanner_scripts/record_assembly.py`
+(`assemble_records()`). The batch pass produces one extraction record per page;
+multi-page records are assembled using the continuation flags:
 
 ```
-group by (source_pdf_path, record_type, location_name, provider_name)
+group by (source_stem, record_type, location_name, provider_name)
 within group: sort by page_num
 merge consecutive pages where continues_to_next=True / continues_from_previous=True
 result: {page_start, page_end, merged_fields}
 ```
 
+`source_stem` is the sidecar-file stem (see `load_case_page_records()` in the same
+module), not a full filesystem path — sufficient to distinguish source documents
+within one scan output directory. When the LLM's `continues_from`/`continues_to`
+flags are absent (service unavailable, or the page was never classified), pages
+fall back to an embedding-similarity check — `_continues()` merges consecutive
+pages whose content embeddings (from the optional `_sidecars/{stem}_embeddings.jsonl`,
+written during scanning — see "Embedding Endpoint" below) score `>= 0.90` cosine
+similarity. With neither signal available, pages are not merged.
+
 ---
 
 ## "List of Records Reviewed" Assembly
 
-Groups all pages by `(location_name, provider_name)` across all source PDFs:
+**Implemented** in `record_assembly.py` (`build_records_reviewed_list()`), computed
+deterministically in Python rather than trusted to the model. Groups all *assembled*
+records by `(location_name, provider_name)`:
 - Date range = `min(service_date)` to `max(service_date)` across the group
 - Record description = primary record type(s) seen for that group
 
 Example output line:
 > *"1. Medical and Billing Records from One Main Physical Therapy, dated 02/04/2020 – 05/15/2026;"*
+
+This list is passed into the large model's case payload (see below) as ground truth
+context — the model is not asked to reproduce it, only to consume it.
+
+---
+
+## Embedding Endpoint (Small Model)
+
+```
+POST /embed
+{
+  "texts": [str, ...]
+}
+→
+{
+  "embeddings": [[float, ...], ...]   // one L2-normalized vector per input text, same order
+}
+```
+
+Used for three purposes (`dpp_scripts/keyword_scanner_scripts/embeddings.py`):
+
+- **RAG context selection** — `case_summary.py` ranks assembled records by relevance
+  before building the large model's payload, so case-level prompts stay within a
+  context budget instead of growing unbounded with case size.
+- **Provider identity clustering** (`provider_clustering.cluster_providers()`) — splits
+  matched pages by provider at scan time. Called once per source PDF from
+  `keyword_scanner_codebase._scan_one()`, batching one identity-text embedding and one
+  content-text embedding per matched page into a single `/embed` call. NPI match wins
+  unconditionally; otherwise pages join the nearest cluster centroid at cosine
+  similarity `>= 0.86`, falling back to case-insensitive name string equality when
+  embeddings are unavailable.
+- **Continuation detection fallback** — see the Multi-Page Record Assembly note above.
+  Reuses the content embedding computed for provider clustering, persisted to
+  `_sidecars/{stem}_embeddings.jsonl`, so no second embedding pass is needed.
+
+Cosine similarity is computed brute-force with numpy — no vector database is used.
+
+---
+
+## Large-Model Endpoint
+
+```
+POST /summarize_case
+{
+  "case_payload": {
+    "case_label": str,
+    "records_reviewed": [str, ...],          // from build_records_reviewed_list()
+    "assembled_records": [
+      {
+        "provider_name": str | null, "location_name": str | null,
+        "record_type": str | null,
+        "service_date_start": str | null, "service_date_end": str | null,
+        "page_start": int, "page_end": int, "source_stem": str | null,
+        "excerpt": str                        // merged_text, possibly RAG-trimmed
+      }, ...
+    ]
+  }
+}
+→
+{
+  "output": "<json string>"   // parses to {records_reviewed, provider_chronology, narrative_summary} — see dpp_scripts/keyword_scanner_scripts/case_summary.py and dpp_scripts/docx_scripts/docx_codebase.py
+}
+```
+
+There is no rule-based fallback for this endpoint — `generate_case_summary()` returns
+`None` if the large-model service is unavailable, and the caller (`ReviewDialog`)
+surfaces that to the user rather than silently degrading.
 
 ---
 

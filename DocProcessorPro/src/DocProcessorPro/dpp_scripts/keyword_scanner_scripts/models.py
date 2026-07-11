@@ -61,6 +61,9 @@ class PageMatch:
     provider_name_hint: str | None = None  # extracted provider name, unverified
     raw_service_date_str: str | None = None  # raw regex-matched date string before ISO parsing
     provider_name_context: str | None = None  # ~150-char text window around provider name match
+    record_type: str | None = None        # LLM-classified record type, if classified
+    llm_confidence: float | None = None   # LLM self-reported confidence, if classified
+    classification_source: str = "keyword_fallback"  # "llm" | "keyword_fallback"
 
 
 @dataclass
@@ -81,6 +84,9 @@ class PageExclusion:
     provider_name_hint: str | None = None
     raw_service_date_str: str | None = None  # raw regex-matched date string before ISO parsing
     provider_name_context: str | None = None  # ~150-char text window around provider name match
+    record_type: str | None = None        # LLM-classified record type, if classified
+    llm_confidence: float | None = None   # LLM self-reported confidence, if classified
+    classification_source: str = "keyword_fallback"  # "llm" | "keyword_fallback"
 
 
 @dataclass
@@ -97,3 +103,5 @@ class ScanResult:
     ]  # 0-indexed page → ISO date strings (all pages)
     page_texts: dict[int, tuple[str, str]] = field(default_factory=dict)
     # 0-indexed page_num → (text, extraction_method)
+    llm_fields: dict[int, dict] = field(default_factory=dict)
+    # 0-indexed page_num → raw extract_page_fields() dict, for pages the LLM classified

@@ -1002,4 +1002,72 @@ def write_page_texts_sidecar(
             }
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+
+def write_llm_fields_sidecar(out_path: "str | Path", llm_fields: "dict[int, dict]") -> None:
+    """Write a JSONL sidecar of per-page LLM classification fields.
+
+    One JSON object per line, keyed by 1-indexed page_num — the same shape
+    _LlmBatchWorker used to produce as a separate post-scan pass.  Downstream
+    consumers (ReviewDialog, record_assembly.load_case_page_records(),
+    feedback_to_training.py) only care that this file exists with this
+    shape, not who wrote it or when.  Writes nothing (no file created) if
+    llm_fields is empty — e.g. the small-model service was unreachable for
+    this PDF, which is what keeps a stale/empty sidecar from ever appearing.
+
+    Schema per line: page_num (1-indexed) plus whatever keys
+    _llm_client.extract_page_fields() returned (record_type, service_date,
+    provider_name, location_name, record_title, continues_from_previous,
+    continues_to_next, confidence — any subset, forward-compatible).
+    """
+    import json
+
+    if not llm_fields:
+        return
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(out, "w", encoding="utf-8") as f:
+        for page_0idx in sorted(llm_fields):
+            record = {"page_num": page_0idx + 1, **llm_fields[page_0idx]}
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def write_page_embeddings_sidecar(
+    out_path: "str | Path", embeddings: "dict[int, list[float]]"
+) -> None:
+    """Write a JSONL sidecar of per-page content embeddings.
+
+    One JSON object per line, keyed by 1-indexed page_num.  Writes nothing
+    (no file created) if embeddings is empty — this is what keeps the
+    sidecar absent when the small-model service was unreachable during the
+    scan, so its mere presence signals "embeddings are available for this
+    stem" to consumers like record_assembly.load_case_page_records().
+
+    Schema per line: {"page_num": int (1-indexed), "embedding": list[float]}
+    """
+    import json
+
+    if not embeddings:
+        return
+
+    out = Path(out_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(out, "w", encoding="utf-8") as f:
+        for page_0idx in sorted(embeddings):
+            record = {"page_num": page_0idx + 1, "embedding": embeddings[page_0idx]}
+            f.write(json.dumps(record) + "\n")
+
+
+def _slugify(name: str, max_len: int = 60) -> str:
+    """Lowercase, filesystem-safe slug for a provider name, used in
+    provider-partitioned output filenames.  Falls back to "provider" if the
+    result would be empty (e.g. name was blank or all punctuation)."""
+    import re
+
+    slug = re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_")
+    slug = slug[:max_len].rstrip("_")
+    return slug or "provider"
+
     log.info("Page-texts sidecar written to %s.", out.name)

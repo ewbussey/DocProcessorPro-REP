@@ -10,8 +10,8 @@ class _ScanWorker(QThread):
 
     progress = Signal(str)
     finished = Signal(
-        int, int, int
-    )  # (pdfs_processed, total_matches, total_exclusions)
+        int, int, int, int
+    )  # (pdfs_processed, total_matches, total_exclusions, llm_classified_count)
     error = Signal(str)
 
     def __init__(
@@ -50,7 +50,8 @@ class _ScanWorker(QThread):
             )
             total_matches = sum(len(r.matches) for r in results.values())
             total_exclusions = sum(len(r.exclusions) for r in results.values())
-            self.finished.emit(len(results), total_matches, total_exclusions)
+            llm_classified_count = sum(len(r.llm_fields) for r in results.values())
+            self.finished.emit(len(results), total_matches, total_exclusions, llm_classified_count)
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -101,71 +102,61 @@ class _UpdateDownloader(QThread):
             self.error.emit(str(exc))
 
 
-class _LlmBatchWorker(QThread):
-    """Runs the LLM batch pass on all _page_texts.jsonl sidecars in output_dir/_sidecars/.
+class _CaseSummaryWorker(QThread):
+    """Assembles reviewed records into a case-level summary and renders it to docx.
 
-    For each sidecar, calls POST /extract_page_fields per page and writes
-    {stem}_llm_fields.jsonl into the same _sidecars/ directory.  Pages where
-    the LLM returns None are silently skipped.
+    Runs record_assembly.assemble_records() + case_summary.generate_case_summary()
+    + docx_codebase.build_summary_docx() off the main thread. There is no
+    rule-based fallback for the summary step — the caller should already have
+    checked _llm_client.is_available("large") before starting this worker, but
+    a None result from the service is still treated as an error here too.
     """
 
     progress = Signal(str)
-    finished = Signal(int, int)  # (pages_processed, pages_skipped)
+    finished = Signal(str)  # absolute path to the generated .docx
     error = Signal(str)
 
-    def __init__(self, output_dir: str) -> None:
+    def __init__(self, output_dir: str, case_label: str) -> None:
         super().__init__()
         self._output_dir = output_dir
+        self._case_label = case_label
 
     def run(self) -> None:
-        import json
-        from pathlib import Path
-
         try:
-            from DocProcessorPro import _llm_client
+            from DocProcessorPro.dpp_scripts.keyword_scanner_scripts.case_summary import (
+                generate_case_summary,
+            )
+            from DocProcessorPro.dpp_scripts.keyword_scanner_scripts.record_assembly import (
+                assemble_records,
+                load_case_page_records,
+            )
+            from DocProcessorPro.dpp_scripts.docx_scripts.docx_codebase import (
+                build_summary_docx,
+            )
 
-            out_dir = Path(self._output_dir)
-            sidecars_dir = out_dir / "_sidecars"
-            sidecar_paths = sorted(sidecars_dir.glob("*_page_texts.jsonl")) if sidecars_dir.exists() else []
-            total_processed = 0
-            total_skipped = 0
+            self.progress.emit("Assembling reviewed records…")
+            page_records = load_case_page_records(self._output_dir)
+            if not page_records:
+                self.error.emit(
+                    "No page data found in _sidecars/ — run a scan before generating a summary."
+                )
+                return
+            assembled = assemble_records(page_records)
 
-            for sidecar_path in sidecar_paths:
-                stem = sidecar_path.name[: -len("_page_texts.jsonl")]
-                out_path = sidecars_dir / f"{stem}_llm_fields.jsonl"
+            self.progress.emit("Requesting case analysis from the large model…")
+            case_summary = generate_case_summary(assembled, self._case_label)
+            if case_summary is None:
+                self.error.emit(
+                    "The large-model service returned no result — case summary generation failed."
+                )
+                return
 
-                pages: list[dict] = []
-                for raw in sidecar_path.read_text(encoding="utf-8").splitlines():
-                    raw = raw.strip()
-                    if raw:
-                        try:
-                            pages.append(json.loads(raw))
-                        except json.JSONDecodeError:
-                            pass
+            self.progress.emit("Writing summary document…")
+            out_dir = Path(self._output_dir) / "_review"
+            docx_path = out_dir / f"{self._case_label}_summary.docx"
+            build_summary_docx(case_summary, self._case_label, docx_path)
 
-                if not pages:
-                    continue
-
-                with open(out_path, "w", encoding="utf-8") as f:
-                    for i, page in enumerate(pages):
-                        self.progress.emit(
-                            f"LLM analysis — {stem}: page {i + 1}/{len(pages)}"
-                        )
-                        text = page.get("text", "")
-                        if not text:
-                            total_skipped += 1
-                            continue
-                        result = _llm_client.extract_page_fields(
-                            text, page.get("extraction_method", "liteparse")
-                        )
-                        if result is None:
-                            total_skipped += 1
-                            continue
-                        result["page_num"] = page["page_num"]
-                        f.write(json.dumps(result, ensure_ascii=False) + "\n")
-                        total_processed += 1
-
-            self.finished.emit(total_processed, total_skipped)
+            self.finished.emit(str(docx_path))
         except Exception as exc:
             self.error.emit(str(exc))
 

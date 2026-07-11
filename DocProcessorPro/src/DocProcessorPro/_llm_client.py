@@ -1,22 +1,34 @@
-"""Thin HTTP client for the local LLM inference service.
+"""Thin HTTP client for the two local LLM inference services (small + large model).
 
-All public functions return None (or safe empty values) when the service is
+All public functions return None (or safe empty values) when a service is
 unavailable, timed out, or returns an unexpected response.  Callers must treat
 None as "fall back to rule-based result" — no exception is ever raised.
 
-The service URL is set once at startup via configure(); the default assumes a
-locally hosted service on port 8765.  Change it via App Settings in the GUI.
+Two independent services are configured, each with its own URL, set once at
+startup via configure_small()/configure_large(); defaults assume two locally
+hosted services on ports 8765 (small) and 8766 (large).  Change them via App
+Settings in the GUI.
 
-Expected service API (implemented separately, e.g. MLX-LM on Mac):
+Expected service APIs (implemented separately, e.g. MLX-LM on Mac — see
+llm_server/ in the repo root for a runnable scaffold):
 
-    GET  /health
-    POST /extract_page_fields   {"text": str, "extraction_method": str}
-                                → {"output": "record_type: ___ | date: ___ | provider: ___ | ..."}
+    Small model (page categorization + embedding), default port 8765:
+        GET  /health
+        POST /extract_page_fields   {"text": str, "extraction_method": str}
+                                    → {"output": "record_type: ___ | date: ___ | provider: ___ | ..."}
+        POST /embed                 {"texts": list[str]}
+                                    → {"embeddings": list[list[float]]}
 
-    The model returns a pipe-delimited string wrapped in a JSON envelope.
+    Large model (case-level analysis + summary generation), default port 8766:
+        GET  /health
+        POST /summarize_case        {"case_payload": dict}
+                                    → {"output": "<json string — see case_summary.py>"}
+
+    The small model returns a pipe-delimited string wrapped in a JSON envelope.
     _parse_pipe_delimited() maps it to the internal field dict.
 
-    Deprecated endpoints (still wired, ignored if service does not support them):
+    Deprecated small-model endpoints (still wired, ignored if service does not
+    support them):
     POST /extract_service_date  {"text": str, "raw": str}  → {"date": str|null}
     POST /extract_provider      {"text": str}               → {"name": str|null, "npi": str|null}
     POST /classify_category     {"text": str, "categories": list[str]} → {"category": str|null}
@@ -33,44 +45,70 @@ import urllib.request
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_URL = "http://localhost:8765"
-_TIMEOUT = 3.0
+_DEFAULT_SMALL_URL = "http://localhost:8765"
+_DEFAULT_LARGE_URL = "http://localhost:8766"
+_DEFAULT_URL = _DEFAULT_SMALL_URL  # deprecated alias, kept for compatibility
+
+_SMALL_TIMEOUT = 3.0   # per-page calls must stay snappy
+_LARGE_TIMEOUT = 90.0  # case-level generation is slow
 _TEXT_LIMIT = 2000
 
-_service_url: str = _DEFAULT_URL
+_small_service_url: str = _DEFAULT_SMALL_URL
+_large_service_url: str = _DEFAULT_LARGE_URL
+
+
+def configure_small(url: str) -> None:
+    """Set the small-model service base URL.  Called once at startup from app settings."""
+    global _small_service_url
+    _small_service_url = url.rstrip("/")
+
+
+def configure_large(url: str) -> None:
+    """Set the large-model service base URL.  Called once at startup from app settings."""
+    global _large_service_url
+    _large_service_url = url.rstrip("/")
 
 
 def configure(url: str) -> None:
-    """Set the LLM service base URL.  Called once at startup from app settings."""
-    global _service_url
-    _service_url = url.rstrip("/")
+    """Deprecated alias for configure_small() — kept for backward compatibility."""
+    configure_small(url)
 
 
-def _post(endpoint: str, payload: dict) -> dict | None:
+def _base_url(which: str) -> str:
+    return _large_service_url if which == "large" else _small_service_url
+
+
+def _timeout(which: str) -> float:
+    return _LARGE_TIMEOUT if which == "large" else _SMALL_TIMEOUT
+
+
+def _post(endpoint: str, payload: dict, which: str = "small") -> dict | None:
     """POST JSON to the service endpoint; return parsed response or None on any failure."""
+    base_url = _base_url(which)
     try:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
-            f"{_service_url}/{endpoint}",
+            f"{base_url}/{endpoint}",
             data=data,
             headers={"Content-Type": "application/json; charset=utf-8"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=_timeout(which)) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as exc:
-        log.debug("LLM service unreachable at %s/%s: %s", _service_url, endpoint, exc)
+        log.debug("LLM service unreachable at %s/%s: %s", base_url, endpoint, exc)
         return None
 
 
-def is_available() -> bool:
+def is_available(which: str = "small") -> bool:
     """Quick health-check.  Returns True if the service responds within the timeout."""
+    base_url = _base_url(which)
     try:
         req = urllib.request.Request(
-            f"{_service_url}/health",
+            f"{base_url}/health",
             method="GET",
         )
-        with urllib.request.urlopen(req, timeout=_TIMEOUT):
+        with urllib.request.urlopen(req, timeout=_timeout(which)):
             return True
     except Exception:
         return False
@@ -187,3 +225,48 @@ def extract_page_fields(page_text: str, extraction_method: str) -> dict | None:
         return None
     parsed = _parse_pipe_delimited(raw)
     return parsed or None
+
+
+def embed_texts(texts: list[str]) -> list[list[float]] | None:
+    """Batch-embed page texts via the small model's /embed endpoint.
+
+    Returns one vector per input text (same order), or None if the service is
+    unavailable or the response is malformed.  Callers must treat None as
+    "no embeddings available" — skip RAG ranking / clustering for this batch,
+    do not raise.
+    """
+    result = _post(
+        "embed",
+        {"texts": [t[:_TEXT_LIMIT] for t in texts]},
+        which="small",
+    )
+    if not result:
+        return None
+    embeddings = result.get("embeddings")
+    if not embeddings or len(embeddings) != len(texts):
+        return None
+    return embeddings
+
+
+def summarize_case(case_payload: dict) -> dict | None:
+    """Ask the large model to analyze an assembled case and produce summary content.
+
+    The service wraps the model's raw output in a JSON envelope:
+        {"output": "<json string — see dpp_scripts/keyword_scanner_scripts/case_summary.py>"}
+
+    Returns the parsed structured summary dict, or None if the service is
+    unavailable, the response is malformed, or the output is not valid JSON.
+    There is no rule-based fallback for this step — None means the caller
+    must tell the user the large model is unavailable, not silently degrade.
+    """
+    result = _post("summarize_case", {"case_payload": case_payload}, which="large")
+    if not result:
+        return None
+    raw = result.get("output", "")
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None

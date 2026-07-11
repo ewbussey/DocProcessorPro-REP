@@ -8,6 +8,7 @@ scan_directory(input_dir, output_dir, categories, min_hits) -> dict[str, list[Pa
 from __future__ import annotations
 
 import csv
+import dataclasses
 import logging
 import os
 import shutil
@@ -26,6 +27,7 @@ from .models import KeywordCategory, PageMatch, PageExclusion, ScanResult
 from .categories import (
     DEFAULT_CATEGORIES, CLINICAL_ANCHOR_CATEGORIES, highest_weight_category,
     _BILLS_MIN_HITS, _BILLS_REQUIRE_CATEGORIES,
+    _LLM_MIN_CONFIDENCE, _RECORD_TYPE_TO_CATEGORY,
     CATEGORY_THERAPY, CATEGORY_MEDICAL_TREATMENT, CATEGORY_BILLING,
     CATEGORY_INJURY_LEGAL, CATEGORY_IMAGING, CATEGORY_BEHAVIORAL_HEALTH,
     CATEGORY_VOCATIONAL, CATEGORY_DOCUMENT_TYPE,
@@ -37,12 +39,14 @@ from .extraction import (
 from .pdf_ops import (
     extract_matched_pages, extract_unmatched_pages,
     write_manifest, write_dates_csv, write_matched_manifest, write_unmatched_manifest,
-    write_page_texts_sidecar,
+    write_page_texts_sidecar, write_llm_fields_sidecar, write_page_embeddings_sidecar,
+    _slugify,
     consolidate_records, consolidate_bills, consolidate_to_pdf,
     consolidate_manifests, consolidate_dates, consolidate_unmatched,
     consolidate_all_scored,
     _make_separator_page,
 )
+from .provider_clustering import cluster_providers
 
 log = logging.getLogger(__name__)
 
@@ -62,7 +66,182 @@ _PER_PDF_SUFFIXES = (
 _SIDECAR_SUFFIXES = (
     "_page_texts.jsonl",
     "_llm_fields.jsonl",
+    "_embeddings.jsonl",
 )
+
+
+def _route_page(
+    page: PageMatch,
+    min_hits: float,
+    require_categories: "frozenset[str] | None",
+    require_anchor: bool,
+) -> str:
+    """Decide which output stream a loosely-matched page belongs in.
+
+    Returns "records", "bills", or "unmatched" (the caller demotes "unmatched"
+    pages to a PageExclusion via _demote_to_exclusion()).
+
+    A confident LLM classification is authoritative and bypasses
+    require_categories/require_anchor — those gates exist to compensate for
+    keyword-scoring's blind spots, which a confident LLM signal doesn't have.
+    It can never promote a page the blocklist already dropped inside
+    scan_pdf(), since such pages never become a PageMatch to begin with.
+    Everything else (no LLM data, low confidence, or an unrecognized/
+    "other_nec" record_type) reapplies exactly the original per-pass keyword
+    logic, so scanning with the LLM service down reproduces today's output.
+    """
+    if page.classification_source == "llm" and (page.llm_confidence or 0.0) >= _LLM_MIN_CONFIDENCE:
+        mapped = _RECORD_TYPE_TO_CATEGORY.get(page.record_type or "", "")
+        if mapped:
+            return "bills" if mapped in _BILLS_REQUIRE_CATEGORIES else "records"
+        # other_nec / unrecognized record_type -> fall through to keyword logic
+
+    cats = set(page.categories)
+    passes_min_hits = page.total_hits >= min_hits
+    passes_required = require_categories is None or bool(cats & require_categories)
+    passes_anchor = not require_anchor or bool(cats & CLINICAL_ANCHOR_CATEGORIES)
+    if passes_min_hits and passes_required and passes_anchor:
+        return "records"
+
+    if page.total_hits >= _BILLS_MIN_HITS and bool(cats & _BILLS_REQUIRE_CATEGORIES):
+        return "bills"
+
+    return "unmatched"
+
+
+def _demote_to_exclusion(
+    page: PageMatch,
+    min_hits: float,
+    require_categories: "frozenset[str] | None",
+    require_anchor: bool,
+) -> PageExclusion:
+    """Convert a loosely-matched page that _route_page() routed to "unmatched"
+    into a PageExclusion, reproducing the exact reason set (and order) the
+    original records-pass keyword gate would have produced."""
+    cats = set(page.categories)
+    reasons: list[str] = []
+    if page.total_hits < min_hits:
+        reasons.append("below_threshold")
+    if require_anchor and not (cats & CLINICAL_ANCHOR_CATEGORIES):
+        reasons.append("no_anchor")
+    if require_categories is not None and not (cats & require_categories):
+        reasons.append("no_required_category")
+    return PageExclusion(
+        page_num=page.page_num,
+        categories=page.categories,
+        keywords_hit=page.keywords_hit,
+        extraction_method=page.extraction_method,
+        total_hits=page.total_hits,
+        dates_on_page=page.dates_on_page,
+        exclusion_reasons=reasons,
+        min_hits_threshold=min_hits,
+        service_date=page.service_date,
+        provider_npi=page.provider_npi,
+        provider_name_hint=page.provider_name_hint,
+        raw_service_date_str=page.raw_service_date_str,
+        provider_name_context=page.provider_name_context,
+        record_type=page.record_type,
+        llm_confidence=page.llm_confidence,
+        classification_source=page.classification_source,
+    )
+
+
+def _cluster_and_embed(
+    matches: "list[PageMatch]",
+    page_texts: "dict[int, tuple[str, str]]",
+    stem: str,
+) -> "tuple[dict[int, str], dict[int, list[float]]]":
+    """Batch-embeds identity + content text for every matched page — one HTTP
+    round-trip covering both, not one call per page — clusters provider
+    identity from the identity embeddings, and returns (page_num ->
+    provider_key, page_num -> content embedding).
+
+    Two separate embeddings per page, not one reused for both purposes:
+    embedding a short provider-identity string would make any two
+    same-provider pages look "continuous" regardless of actual content,
+    collapsing continuation detection (record_assembly.py) into a
+    same-provider detector.
+
+    content_embedding is only populated for pages that were actually
+    embedded — empty when the small-model service is unreachable, which is
+    what keeps the embeddings sidecar unwritten when running offline.
+    """
+    if not matches:
+        return {}, {}
+
+    from DocProcessorPro import _llm_client
+
+    identity_texts = [
+        (m.provider_name_context or m.provider_name_hint or "").strip() for m in matches
+    ]
+    content_texts = [page_texts.get(m.page_num, ("", ""))[0] for m in matches]
+
+    embeddings = _llm_client.embed_texts(identity_texts + content_texts)
+    if embeddings is None:
+        identity_embeddings: "list[list[float] | None]" = [None] * len(matches)
+        content_embedding_by_page: dict[int, list[float]] = {}
+    else:
+        n = len(matches)
+        identity_embeddings = list(embeddings[:n])
+        content_embedding_by_page = {
+            m.page_num: emb for m, emb in zip(matches, embeddings[n:])
+        }
+
+    page_records = [
+        {
+            "page_num": m.page_num,
+            "provider_npi": m.provider_npi,
+            "provider_name": m.provider_name_hint,
+            "identity_embedding": identity_embeddings[i],
+        }
+        for i, m in enumerate(matches)
+    ]
+    provider_key_by_page = cluster_providers(page_records, stem)
+
+    return provider_key_by_page, content_embedding_by_page
+
+
+def _write_provider_partitions(
+    pdf_path: Path,
+    matches: "list[PageMatch]",
+    provider_key_by_page: "dict[int, str]",
+    out_dir: Path,
+    out_stem: str,
+    stream_suffix: str,
+    min_hits_threshold: float,
+    page_buffer: int,
+) -> None:
+    """Writes {out_stem}__{slug}_{stream_suffix}.pdf/_manifest.csv per
+    distinct provider among matches — additional outputs alongside the
+    unpartitioned {out_stem}_{stream_suffix}.pdf, which is always written
+    separately and unchanged. Skipped entirely when every page shares one
+    provider_key, since the single partition would just duplicate the
+    unpartitioned file. Cross-PDF provider consolidation is out of scope —
+    this only partitions within a single source PDF's own matched pages.
+    """
+    if not matches:
+        return
+    groups: dict[str, list[PageMatch]] = {}
+    for m in matches:
+        groups.setdefault(provider_key_by_page.get(m.page_num, ""), []).append(m)
+    if len(groups) <= 1:
+        return
+
+    for key, group_matches in groups.items():
+        partition_stem = f"{out_stem}__{_slugify(key)}"
+        extract_matched_pages(
+            str(pdf_path),
+            group_matches,
+            str(out_dir / f"{partition_stem}_{stream_suffix}.pdf"),
+            page_buffer=page_buffer,
+        )
+        write_matched_manifest(
+            str(pdf_path),
+            group_matches,
+            str(out_dir / f"{partition_stem}_{stream_suffix}_manifest.csv"),
+            min_hits_threshold=min_hits_threshold,
+            scan_stream=stream_suffix,
+        )
 
 
 def _unique_stem(out_dir: Path, safe_stem: str) -> str:
@@ -143,6 +322,17 @@ def scan_directory(
     # Keys are unique per-thread (one PDF per worker), so no lock is needed.
     _out_stems: dict[str, str] = {}
 
+    # Resolved ONCE for the whole batch, not per page or per PDF — a down
+    # service costs one health-check timeout total here, not one per page.
+    from DocProcessorPro import _llm_client
+    llm_available = _llm_client.is_available("small")
+    if progress_callback:
+        progress_callback(
+            "Small-model LLM classification available — using it as primary."
+            if llm_available
+            else "Small-model LLM service unavailable — using keyword fallback only."
+        )
+
     def _scan_one(pdf_path: Path, safe_stem: str) -> tuple[str, ScanResult]:
         empty = ScanResult(
             matches=[],
@@ -165,64 +355,63 @@ def scan_directory(
                 progress_callback(f"Deposition saved: {dest.name}")
             return safe_stem, empty
 
-        # ── Pass R: records (clinical content) ──────────────────────────────
+        # ── Single classify pass: loose union gate + inline LLM classification ──
+        # Loose params admit the superset either the old records or bills pass
+        # would have kept; _route_page() below reapplies the real, strict
+        # per-stream criteria (LLM-primary, keyword-fallback).
         try:
-            records_result = scan_pdf(
-                str(pdf_path),
-                categories,
-                min_hits=min_hits,
-                require_categories=require_categories,
-                require_anchor=require_anchor,
-                progress_callback=progress_callback,
-            )
-        except Exception:
-            log.exception("Failed to scan %s (records pass) — skipping.", pdf_path.name)
-            return safe_stem, empty
-
-        # ── Pass B: bills/affidavits (low threshold, BILLING + INJURY_LEGAL) ─
-        try:
-            bills_result = scan_pdf(
+            scan_result = scan_pdf(
                 str(pdf_path),
                 categories,
                 min_hits=_BILLS_MIN_HITS,
-                require_categories=_BILLS_REQUIRE_CATEGORIES,
+                require_categories=None,
                 require_anchor=False,
                 progress_callback=progress_callback,
+                llm_available=llm_available,
             )
         except Exception:
-            log.exception("Failed to scan %s (bills pass) — skipping bills.", pdf_path.name)
-            bills_result = empty
+            log.exception("Failed to scan %s — skipping.", pdf_path.name)
+            return safe_stem, empty
 
-        # ── De-duplication: records take precedence over bills ───────────────
-        # A page matched by records is excluded from the bills output even if
-        # it also satisfies the bills criteria.
-        records_page_nums: set[int] = {m.page_num for m in records_result.matches}
-        bills_matches = [
-            m for m in bills_result.matches if m.page_num not in records_page_nums
+        # ── Route each loosely-matched page into records / bills / unmatched ──
+        records_matches: list[PageMatch] = []
+        bills_matches: list[PageMatch] = []
+        demoted: list[PageExclusion] = []
+        for page in scan_result.matches:
+            stream = _route_page(page, min_hits, require_categories, require_anchor)
+            if stream == "records":
+                records_matches.append(page)
+            elif stream == "bills":
+                bills_matches.append(page)
+            else:
+                demoted.append(
+                    _demote_to_exclusion(page, min_hits, require_categories, require_anchor)
+                )
+
+        # Blocklist exclusions from the loose scan_pdf() call stamped the
+        # loose min_hits (0.3) into min_hits_threshold; restore the real
+        # Pass-R threshold so the manifest column and the Review dialog's
+        # score_ratio calculation stay correct.
+        corrected_exclusions = [
+            dataclasses.replace(e, min_hits_threshold=min_hits) for e in scan_result.exclusions
         ]
+        final_unmatched = corrected_exclusions + demoted
 
-        # ── Unmatched: excluded by records AND not matched by bills ──────────
-        all_matched: set[int] = records_page_nums | {m.page_num for m in bills_matches}
-        records_excl_nums: set[int] = {e.page_num for e in records_result.exclusions}
-        merged_exclusions = list(records_result.exclusions) + [
-            e for e in bills_result.exclusions if e.page_num not in records_excl_nums
-        ]
-        final_unmatched = [e for e in merged_exclusions if e.page_num not in all_matched]
+        # ── Provider identity clustering + content embeddings ────────────────
+        routed_matches = records_matches + bills_matches
+        provider_key_by_page, content_embeddings = _cluster_and_embed(
+            routed_matches, scan_result.page_texts, safe_stem
+        )
 
-        # ── Synthetic ScanResult (preserves public interface) ────────────────
+        # ── Synthetic ScanResult (preserves public interface) ─────────────────
         combined = ScanResult(
-            matches=records_result.matches + bills_matches,
+            matches=routed_matches,
             exclusions=final_unmatched,
-            source_date_first=(
-                records_result.source_date_first or bills_result.source_date_first
-            ),
-            source_date_last=max(
-                filter(None, [records_result.source_date_last,
-                               bills_result.source_date_last]),
-                default=None,
-            ),
-            source_date_count=records_result.source_date_count,
-            all_page_dates=records_result.all_page_dates,
+            source_date_first=scan_result.source_date_first,
+            source_date_last=scan_result.source_date_last,
+            source_date_count=scan_result.source_date_count,
+            all_page_dates=scan_result.all_page_dates,
+            llm_fields=scan_result.llm_fields,
         )
 
         # Resolve a non-conflicting stem before writing any output files.
@@ -234,31 +423,35 @@ def scan_directory(
                 pdf_path.name, safe_stem, out_stem,
             )
 
-        if records_result.matches:
+        if records_matches:
             extract_matched_pages(
                 str(pdf_path),
-                records_result.matches,
+                records_matches,
                 str(out_dir / f"{out_stem}_records.pdf"),
                 page_buffer=page_buffer,
             )
             write_manifest(
-                records_result.matches,
+                records_matches,
                 str(out_dir / f"{out_stem}_manifest.csv"),
-                source_date_first=records_result.source_date_first,
-                source_date_last=records_result.source_date_last,
-                source_date_count=records_result.source_date_count,
+                source_date_first=scan_result.source_date_first,
+                source_date_last=scan_result.source_date_last,
+                source_date_count=scan_result.source_date_count,
                 scan_stream="records",
             )
             write_matched_manifest(
                 str(pdf_path),
-                records_result.matches,
+                records_matches,
                 str(out_dir / f"{out_stem}_records_manifest.csv"),
                 min_hits_threshold=min_hits,
                 scan_stream="records",
             )
             write_dates_csv(
-                records_result.all_page_dates,
+                scan_result.all_page_dates,
                 str(out_dir / f"{out_stem}_dates.csv"),
+            )
+            _write_provider_partitions(
+                pdf_path, records_matches, provider_key_by_page,
+                out_dir, out_stem, "records", min_hits, page_buffer,
             )
         else:
             log.info("%s: no records matches.", pdf_path.name)
@@ -277,6 +470,10 @@ def scan_directory(
                 min_hits_threshold=_BILLS_MIN_HITS,
                 scan_stream="bills",
             )
+            _write_provider_partitions(
+                pdf_path, bills_matches, provider_key_by_page,
+                out_dir, out_stem, "bills", _BILLS_MIN_HITS, page_buffer,
+            )
         else:
             log.info("%s: no bills matches.", pdf_path.name)
 
@@ -293,14 +490,22 @@ def scan_directory(
                 scan_stream="unmatched",
             )
 
-        if records_result.page_texts:
+        if scan_result.page_texts:
             sidecars_dir = out_dir / "_sidecars"
             sidecars_dir.mkdir(exist_ok=True)
             write_page_texts_sidecar(
                 sidecars_dir / f"{out_stem}_page_texts.jsonl",
-                records_result.page_texts,
+                scan_result.page_texts,
                 combined.matches,
                 combined.exclusions,
+            )
+            write_llm_fields_sidecar(
+                sidecars_dir / f"{out_stem}_llm_fields.jsonl",
+                scan_result.llm_fields,
+            )
+            write_page_embeddings_sidecar(
+                sidecars_dir / f"{out_stem}_embeddings.jsonl",
+                content_embeddings,
             )
 
         return safe_stem, combined

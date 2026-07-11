@@ -9,6 +9,7 @@ import sys
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import TypedDict
 
 import pytesseract
 from liteparse import LiteParse
@@ -18,6 +19,13 @@ from .models import KeywordCategory, PageMatch, PageExclusion, ScanResult
 from .categories import CLINICAL_ANCHOR_CATEGORIES, _BILLS_MIN_HITS, _BILLS_REQUIRE_CATEGORIES
 
 log = logging.getLogger(__name__)
+
+
+class PageClassification(TypedDict):
+    classification_source: str  # "llm" | "keyword_fallback"
+    record_type: str | None
+    confidence: float
+    llm_fields: dict | None
 
 _MIN_NATIVE_CHARS = 100
 
@@ -474,6 +482,46 @@ def _next_deposition_path(out_dir: Path) -> Path:
 # CORE SCANNER
 
 
+def classify_page(text: str, extraction_method: str, llm_available: bool) -> PageClassification:
+    """LLM-primary, keyword-fallback per-page classification. Never raises.
+
+    Does NOT call _llm_client.is_available() itself — availability is resolved
+    once per batch by the caller (scan_directory()) and passed in, so a down
+    LLM service costs one health-check timeout total, not one per page.
+
+    Returns:
+        {"classification_source": "llm", "record_type": str|None,
+         "confidence": float, "llm_fields": dict}
+        or, when llm_available is False or the service call fails/returns None:
+        {"classification_source": "keyword_fallback", "record_type": None,
+         "confidence": 0.0, "llm_fields": None}
+    """
+    if not llm_available:
+        return {
+            "classification_source": "keyword_fallback",
+            "record_type": None,
+            "confidence": 0.0,
+            "llm_fields": None,
+        }
+
+    from DocProcessorPro import _llm_client
+
+    fields = _llm_client.extract_page_fields(text, extraction_method)
+    if fields is None:
+        return {
+            "classification_source": "keyword_fallback",
+            "record_type": None,
+            "confidence": 0.0,
+            "llm_fields": None,
+        }
+    return {
+        "classification_source": "llm",
+        "record_type": fields.get("record_type"),
+        "confidence": float(fields.get("confidence") or 0.0),
+        "llm_fields": fields,
+    }
+
+
 def scan_pdf(
     pdf_path: str,
     categories: list[KeywordCategory],
@@ -481,6 +529,7 @@ def scan_pdf(
     require_categories: frozenset[str] | None = None,
     require_anchor: bool = False,
     progress_callback: Callable[[str], None] | None = None,
+    llm_available: bool = False,
 ) -> ScanResult:
     """
     Scan every page of a PDF for keyword matches and extract all dates.
@@ -489,6 +538,14 @@ def scan_pdf(
     document), then falls back to Tesseract OCR for any pages whose native
     text yield falls below _MIN_NATIVE_CHARS. Keyword matching and date
     extraction run after both passes across all pages.
+
+    llm_available: whether the small-model LLM service is reachable, resolved
+    once by the caller (see classify_page()). When True, every page that
+    clears the blocklist/zero-score gate is also classified by the LLM;
+    min_hits/require_categories/require_anchor still gate PageMatch/
+    PageExclusion construction using the keyword score exactly as before —
+    routing pages by LLM classification instead is the caller's job
+    (see keyword_scanner_codebase._route_page()), not this function's.
 
     Returns: ScanResult with matched pages and per-document date summary.
     """
@@ -556,6 +613,7 @@ def scan_pdf(
     exclusions: list[PageExclusion] = []
     all_page_dates: dict[int, list[str]] = {}
     all_dates: set[datetime.date] = set()
+    llm_fields_by_page: dict[int, dict] = {}
 
     for i, (text, method) in enumerate(page_texts):
         page_dates = _extract_dates(text)
@@ -603,8 +661,26 @@ def scan_pdf(
                 )
             continue
 
-        if weighted_score == 0.0:
-            continue  # definitively non-clinical — not worth reviewing
+        # Classify before the zero-score gate below, so a page the keyword
+        # scanner finds no signal on can still be rescued by a confident LLM
+        # classification — this is what makes the LLM actually primary rather
+        # than merely refining pages the keyword scanner already liked. Blank
+        # pages are skipped — nothing for the model to classify.
+        if text.strip():
+            classification = classify_page(text, method, llm_available)
+        else:
+            classification: PageClassification = {
+                "classification_source": "keyword_fallback",
+                "record_type": None,
+                "confidence": 0.0,
+                "llm_fields": None,
+            }
+        llm_classified = classification["classification_source"] == "llm"
+        if llm_classified and classification["llm_fields"] is not None:
+            llm_fields_by_page[i] = classification["llm_fields"]
+
+        if weighted_score == 0.0 and not llm_classified:
+            continue  # no keyword signal and no LLM opinion — definitively skip
 
         passes_min_hits = weighted_score >= min_hits
         passes_required = require_categories is None or bool(
@@ -613,7 +689,10 @@ def scan_pdf(
         passes_anchor = not require_anchor or bool(
             set(matched_categories) & CLINICAL_ANCHOR_CATEGORIES
         )
-        if passes_min_hits and passes_required and passes_anchor:
+        # An LLM classification (of any confidence — the routing threshold is
+        # applied downstream by the caller) always admits the page as a match
+        # candidate, even if the keyword score alone would not.
+        if (passes_min_hits and passes_required and passes_anchor) or llm_classified:
             matches.append(
                 PageMatch(
                     page_num=i,
@@ -627,6 +706,9 @@ def scan_pdf(
                     provider_name_hint=page_name_hint,
                     raw_service_date_str=raw_svc_str,
                     provider_name_context=name_ctx,
+                    record_type=classification["record_type"],
+                    llm_confidence=classification["confidence"],
+                    classification_source=classification["classification_source"],
                 )
             )
             log.debug("Page %d matched: %s", i + 1, matched_categories)
@@ -653,6 +735,9 @@ def scan_pdf(
                     provider_name_hint=page_name_hint,
                     raw_service_date_str=raw_svc_str,
                     provider_name_context=name_ctx,
+                    record_type=classification["record_type"],
+                    llm_confidence=classification["confidence"],
+                    classification_source=classification["classification_source"],
                 )
             )
 
@@ -673,6 +758,7 @@ def scan_pdf(
         source_date_count=len(unique_dates),
         all_page_dates=all_page_dates,
         page_texts={i: pt for i, pt in enumerate(page_texts)},
+        llm_fields=llm_fields_by_page,
     )
 
 
