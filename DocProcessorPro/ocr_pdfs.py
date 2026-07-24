@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import re
 import shutil
 import sys
 import tempfile
@@ -245,8 +246,8 @@ def liteparse_pdf(
     layout/Markdown reconstruction on top of the resulting searchable PDF.
 
     Writes one file (named after the PDF, extension matching output_format,
-    pages separated by form-feed markers) into output_dir and returns its
-    path. For markdown output, table regions are additionally detected with
+    pages separated by "--- Page N ---" markers) into output_dir and returns
+    its path. For markdown output, table regions are additionally detected with
     pdfplumber and appended as a dedicated "Extracted Tables" section, since
     pdfplumber's line/text based table detection is generally more reliable
     than LiteParse's layout-inferred markdown tables.
@@ -273,7 +274,10 @@ def liteparse_pdf(
             dest.write_text(json.dumps(result, indent=2), encoding="utf-8")
             return dest
 
-        text = "\n\f\n".join(page.text or "" for page in result.pages)
+        text = "\n\n".join(
+            f"--- Page {i} ---\n\n{page.text or ''}"
+            for i, page in enumerate(result.pages, 1)
+        )
 
         if output_format == "markdown" and pdfplumber_tables:
             tables_by_page = _pdfplumber_page_tables_markdown(ocr_source)
@@ -289,6 +293,9 @@ def liteparse_pdf(
     return dest
 
 
+
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -302,9 +309,15 @@ def main() -> None:
         )
     )
 
-    ap.add_argument("input_dir", type=Path, help="Directory containing source PDFs")
     ap.add_argument(
-        "output_dir", type=Path, help="Directory for searchable output PDFs"
+        "input_dir", 
+        type=Path, 
+        help="Directory containing source PDFs"
+    )
+    ap.add_argument(
+        "output_dir", 
+        type=Path, 
+        help="Directory for searchable output PDFs"
     )
     ap.add_argument(
         "--ocr_pdfs",
